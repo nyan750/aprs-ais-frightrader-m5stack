@@ -2,8 +2,9 @@
 
 M5Stack Basic（ESP32 / ILI9342C 320×240）で動く、APRS・航空機・船舶のマップ表示機です。
 ESP32-2432S028（CYD）版 v78 から移植したもので、タッチ操作を M5Stack の3ボタン操作に置き換えています。
+<img src="aprs.jpg" width="480">
 
-ファームウェア版数: **M5 v4**（スプラッシュ表示で確認できます）
+<img src="ais.jpg" width="480">
 
 ## 画面
 
