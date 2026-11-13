@@ -22,6 +22,10 @@
 #include <SPI.h>
 #include <math.h>
 #include <esp_heap_caps.h>
+#include <esp_partition.h>
+#include <esp_spi_flash.h>
+#include <esp_task_wdt.h>
+#include "pngle/pngle.h"   // vendored PNG decoder for map generation (MIT)
 #include "lgfx/utility/lgfx_miniz.h"   // tinfl inflate, already linked via LovyanGFX
 #include <esp_system.h>
 #include "LGFX_M5.h"
@@ -109,7 +113,8 @@ static void handleRoot() {
   h += "<label>受信範囲 km<input name='range' type='number' value='" + String(cfgRangeKm) + "'></label>";
   h += "<label>AIS APIキー (aisstream.io)<input name='aiskey' value='" + htmlEsc(cfgAisKey) + "'></label>";
   h += "<button type='submit'>保存して再起動</button></form>"
-       "<p>設定は本体に保存されます。config.h は初期値です。</p></body></html>";
+       "<p>設定は本体に保存されます。config.h は初期値です。</p>"
+       "<p><a href='/mapgen'>地図を作り直す</a>（中心の緯度経度に合わせて再生成します。数分かかります）</p></body></html>";
   cfgServer.send(200, "text/html", h);
 }
 
@@ -144,6 +149,21 @@ static void handleSave() {
   ESP.restart();
 }
 
+static void handleMapGen() {
+  portalLastActivityMs = millis();
+  Preferences p;
+  p.begin("aprsmap", false);
+  p.putBool("mgforce", true);
+  p.end();
+  cfgServer.send(200, "text/html",
+    "<!DOCTYPE html><html lang='ja'><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:sans-serif;margin:16px'><h2>地図を再生成します</h2>"
+    "<p>再起動して、中心の緯度経度に合わせて地図を作り直します（数分かかります）。</p></body></html>");
+  delay(1000);
+  ESP.restart();
+}
+
 static void handleNotFound() {
   portalLastActivityMs = millis();
   String loc = portalApMode ? "http://192.168.4.1/" : "/";
@@ -156,6 +176,7 @@ static void startConfigServer() {
   cfgServerStarted = true;
   cfgServer.on("/", HTTP_GET, handleRoot);
   cfgServer.on("/save", HTTP_POST, handleSave);
+  cfgServer.on("/mapgen", HTTP_GET, handleMapGen);
   cfgServer.onNotFound(handleNotFound);
   cfgServer.begin();
 }
@@ -217,6 +238,12 @@ static void runPortal() {
   }
 }
 
+// v5.1 diagnostics: remember the last Wi-Fi disconnect reason.
+static volatile int wifiDiscReason = -1;
+static void onWifiDisc(WiFiEvent_t ev, WiFiEventInfo_t info) {
+  wifiDiscReason = info.wifi_sta_disconnected.reason;
+}
+
 // Connect with the saved settings; fall back to the setup portal.
 static void wifiPhase(bool forcePortal) {
   bool haveCreds = cfgSsid.length() > 0 && cfgSsid != "YOUR_SSID";
@@ -225,6 +252,7 @@ static void wifiPhase(bool forcePortal) {
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setCursor(10, 60);
     tft.print("WiFi connecting...");
+    WiFi.onEvent(onWifiDisc, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     WiFi.mode(WIFI_STA);
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
     uint32_t t0 = millis();
@@ -234,6 +262,24 @@ static void wifiPhase(bool forcePortal) {
       MDNS.begin("aprs-map");
       return;
     }
+    // v5.1: show WHY on screen + serial before falling into the portal.
+    tft.fillScreen(TFT_BLACK);
+    tft.setFont(&fonts::Font0);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(10, 30);
+    tft.print("WiFi FAILED");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(10, 55);
+    tft.printf("SSID: [%s]", cfgSsid.c_str());
+    tft.setCursor(10, 75);
+    tft.printf("status=%d reason=%d", (int)WiFi.status(), wifiDiscReason);
+    tft.setCursor(10, 100);
+    tft.print("reason 201=SSID not found (5GHz?)");
+    tft.setCursor(10, 115);
+    tft.print("reason 15/205 = wrong password");
+    Serial.printf("WIFI FAIL ssid=[%s] status=%d reason=%d\n",
+                  cfgSsid.c_str(), (int)WiFi.status(), wifiDiscReason);
+    delay(6000);
     WiFi.disconnect();
   }
   runPortal();
@@ -555,10 +601,922 @@ static bool   geoToPx(double lat, double lon, int& px, int& py);
 // the BMP files on the SD card exactly.
 #undef MAPS
 #define MAP_COUNT 2
-static const MapDef MAP_LIST[MAP_COUNT] = {
+static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when generated maps are active (v5)
   { "/map1.bmp", "KAGAWA",  34.60, 33.90, 133.40, 134.90 },  // APRS screen: Kagawa only (z11 source)
   { "/map2.bmp", "OKAYAMA", 35.40, 33.90, 133.25, 134.95 },  // Flight screen: Okayama + Kagawa
 };
+
+// ---------------- on-device map generation (m5 v5 prototype) --------
+// At boot, if no generated maps exist for the configured centre (or a
+// regeneration was requested from the portal), the device downloads
+// GSI (Geospatial Information Authority of Japan) blank + standard
+// tiles for the area around home, classifies coastlines against the
+// standard tiles' sea mask, downscales to the usual 640x480 4-bit
+// gray + class-bit format, and stores the result in the dedicated
+// "mapdata" flash partition. The renderer then reads the generated
+// maps through a flash mmap instead of the baked-in Takamatsu maps,
+// which remain the fallback. Map bounds mirror make_maps.py's layout
+// relative to the centre. PNG decoding: pngle (c) kikuchan, MIT.
+// Prototype simplifications vs the PC pipeline: no place-name text
+// removal, no sea-component size filter, box min/fraction pooling
+// instead of LANCZOS, no coastline thinning.
+#define GEN_MAGIC 0x4D473501u            // 'MG5' v1
+#define GEN_HDR_BYTES 0x1000
+#define GEN_MAP_BYTES (153600 + 38400)   // gray + class per map
+#define GEN_SCR_OFF  0x100000            // pass-1 aggregate scratch
+#define GEN_SCR_GRAY GEN_SCR_OFF
+#define GEN_SCR_SEA  (GEN_SCR_OFF + 307200)
+#define GEN_TOTAL_END (GEN_SCR_SEA + 307200)
+#define GEN_STAGE_OFF GEN_TOTAL_END   // v6: raw-tile stage up to partition end
+
+struct GenHeader {
+  uint32_t magic, ver;
+  double homeLat, homeLon;
+  double b[2][4];                        // N, S, W, E per map
+  uint32_t sum[2];                       // byte sum of gray+class
+  uint32_t reserved[8];
+};
+
+static const esp_partition_t* genPart = nullptr;
+static const uint8_t* genMapPtr = nullptr;   // mmap base of genPart
+static spi_flash_mmap_handle_t genMmapH = 0;
+static bool genMapsActive = false;
+static const uint8_t* mapGrayPtr[2]  = { MAP_GRAY[0],  MAP_GRAY[1] };
+static const uint8_t* mapClassPtr[2] = { MAP_CLASS[0], MAP_CLASS[1] };
+
+static double mgGx(double lon, int z) { return (lon + 180.0) / 360.0 * 256.0 * (1 << z); }
+static double mgGy(double lat, int z) {
+  double r = lat * M_PI / 180.0;
+  return (1.0 - log(tan(r) + 1.0 / cos(r)) / M_PI) / 2.0 * 256.0 * (1 << z);
+}
+
+static void mgShow(const char* l1, const char* l2, int pct) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setFont(&fonts::Font2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(8, 16);  tft.print("MAP GENERATION");
+  tft.setFont(&fonts::Font0);
+  tft.setCursor(8, 44);  tft.print("GSI tiles -> onboard maps");
+  tft.setCursor(8, 64);  tft.print(l1);
+  tft.setCursor(8, 84);  tft.print(l2 ? l2 : "");
+  tft.drawRect(8, 108, 304, 14, TFT_WHITE);
+  if (pct > 0) tft.fillRect(9, 109, 302 * (pct > 100 ? 100 : pct) / 100, 12, TFT_GREEN);
+  tft.setCursor(8, 134); tft.printf("%d %%", pct);
+  tft.setCursor(8, 170); tft.print("Do not power off.");
+}
+
+// ---- pass 1: tile streaming into per-output-row aggregates ----
+static int mgMode = 0;                     // 0 = std tile (sea bits), 1 = blank (accumulate)
+static int mgTileOx = 0, mgTileOy = 0;     // global px of tile top-left
+// Generation-only scratch lives in ONE heap block (allocated in
+// mgOneMap, freed on exit) - as statics it overflowed DRAM BSS.
+static uint8_t* mgWork = nullptr;
+static const char* mgFail = "";    // last generation failure step
+static pngle_t* mgPng = nullptr;   // persistent decoder (allocated in setup)
+static bool mgAllocPng();          // v6: defined near mapGenBoot
+static bool mgAllocWorkBuffers();
+static void mgFreeWorkBuffers();   // v7.1 forward declaration
+// v5.17: aggregates are two separate 10 KB allocations (mgAggGray/Sea)
+static int mgLastHttp = 0;         // last non-200 tile http code
+static int mgTilesOk = 0;          // tiles fetched OK in this generation
+static uint8_t* mgSeaBits = nullptr;       // [256*32] sea flags of the current tile
+static uint16_t* mgColW = nullptr;         // [640]
+static uint8_t* mgRowH = nullptr;          // [480]
+static uint8_t* mgScrGrayRow = nullptr;    // [640]
+static uint8_t* mgScrSeaRow = nullptr;     // [640]
+static uint8_t* mgGrayCur = nullptr;       // [640] pass 2 row being emitted
+static uint8_t* mgRingInk = nullptr;       // [13*80] packed bits
+static uint8_t* mgRingSea = nullptr;       // [13*80] packed bits
+static int mgRingRow[13];
+static int mgCropX0 = 0, mgCropY0 = 0, mgCropW = 0, mgCropH = 0;
+static int mgBandOy0 = 0, mgBandRows = 0;
+static int mgStripX0 = 0;   // v6: output column where the current strip starts
+static uint8_t* mgAggGray = nullptr;       // [bandRows][640] min luminance
+static uint8_t* mgAggSea = nullptr;        // [bandRows][640] sea pixel count
+static uint32_t mgWdtCtr = 0;
+static long mgPixels = 0;          // v6.3: pixels drawn by the current decode
+static char mgFailDetail[80] = ""; // v6.3: extra line for the FAILED screen
+RTC_DATA_ATTR static uint32_t mgCkpt = 0;   // v8.6: survives warm resets:
+// (map+1)<<24 | strip<<8 | phase (1=fetch, 2=decode, 3=classify)
+static int mgStripNo = 0;
+
+static void mgAccum(int gx, int gy, int r, int g, int b, int lx, int ly) {
+  int cx = gx - mgCropX0, cy = gy - mgCropY0;
+  if (cx < 0 || cy < 0 || cx >= mgCropW || cy >= mgCropH) return;
+  int oy = (int)((double)cy * 480.0 / mgCropH);
+  int ox = (int)((double)cx * 640.0 / mgCropW);
+  int lo = oy - mgBandOy0;
+  if (lo < 0 || lo >= mgBandRows) return;
+  int lum = (r * 77 + g * 150 + b * 29) >> 8;
+  int sx = ox - mgStripX0;   // v6: aggregates cover one 160-col strip
+  if (sx < 0 || sx >= 160) return;
+  uint8_t* gm = mgAggGray + lo * 160 + sx;
+  if (lum < *gm) *gm = (uint8_t)lum;
+  if (mgSeaBits[ly * 32 + (lx >> 3)] & (0x80 >> (lx & 7))) {
+    uint8_t* sc = mgAggSea + lo * 160 + sx;
+    if (*sc < 255) (*sc)++;
+  }
+}
+
+static void mgDrawCb(pngle_t* png, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                     const uint8_t rgba[4]) {
+  (void)png;
+  mgPixels += (long)w * (long)h;   // v6.3 diagnostics
+  for (uint32_t dy = 0; dy < h; dy++)
+    for (uint32_t dx = 0; dx < w; dx++) {
+      int lx = (int)x + (int)dx, ly = (int)y + (int)dy;
+      if (lx > 255 || ly > 255) continue;
+      if (mgMode == 0) {
+        int bb = rgba[2], rr = rgba[0];
+        if (bb - rr > 25 && bb > 120)
+          mgSeaBits[ly * 32 + (lx >> 3)] |= (uint8_t)(0x80 >> (lx & 7));
+      } else if (mgMode == 1) {
+        mgAccum(mgTileOx + lx, mgTileOy + ly, rgba[0], rgba[1], rgba[2], lx, ly);
+      }   // mode 2 = warm-up fetch: decode but discard every pixel
+    }
+  if ((++mgWdtCtr & 0x3FF) == 0) esp_task_wdt_reset();
+}
+
+static WiFiClientSecure mgTls;     // persistent: per-tile TLS handshakes
+static HTTPClient mgHttp;          // exhausted the heap (http -1)
+static bool mgTlsInit = false;
+
+static bool __attribute__((noinline)) mgFetchTile(int z, int tx, int ty, const char* layer, int mode) {
+  char url[96];
+  snprintf(url, sizeof(url), "https://cyberjapandata.gsi.go.jp/xyz/%s/%d/%d/%d.png",
+           layer, z, tx, ty);
+  if (!mgTlsInit) { mgTls.setInsecure(); mgTlsInit = true; }
+  for (int attempt = 0; attempt < 3; attempt++) {
+    mgHttp.setReuse(true);
+    mgHttp.setTimeout(15000);
+    if (!mgHttp.begin(mgTls, url)) { mgLastHttp = -101; return false; }
+    mgHttp.addHeader("User-Agent", "MuseAPRSMap/1.0 (personal APRS viewer project)");
+    int code = mgHttp.GET();
+    if (code != 200) {
+      mgLastHttp = code;
+      Serial.printf("MAPGEN tile %s z%d %d/%d http %d\n", layer, z, tx, ty, code);
+      mgHttp.end();
+      mgTls.stop();   // force a fresh handshake on the retry
+      delay(400);
+      continue;
+    }
+    mgMode = mode;
+    mgTileOx = tx * 256;
+    mgTileOy = ty * 256;
+    if (mode == 0) memset(mgSeaBits, 0, 8192);
+    if (!mgPng) { mgLastHttp = -100; mgHttp.end(); return false; }
+    pngle_t* png = mgPng;   // persistent instance (see setup)
+    pngle_reset(png);
+    WiFiClient* stream = mgHttp.getStreamPtr();
+    int total = mgHttp.getSize();   // Content-Length (-1 if unknown)
+    int fed = 0;
+    uint8_t buf[1024];
+    bool ok = true;
+    uint32_t t0 = millis();
+    while (total < 0 ? mgHttp.connected() : fed < total) {
+      size_t avail = stream->available();
+      if (avail) {
+        if (avail > sizeof(buf)) avail = sizeof(buf);
+        int n = stream->readBytes(buf, avail);
+        if (n > 0) {
+          fed += n;
+          if (pngle_feed(png, buf, n) < 0) { ok = false; break; }
+        }
+      } else {
+        delay(1);
+      }
+      if (millis() - t0 > 30000) { ok = false; break; }
+      esp_task_wdt_reset();
+    }
+    mgHttp.end();
+    if (ok) { mgTilesOk++; return true; }
+    mgTls.stop();
+    delay(400);
+  }
+  snprintf(mgFailDetail, sizeof(mgFailDetail),
+           "z%d tx%d ty%d %s code %d heap %u", z, tx, ty, layer,
+           mgLastHttp, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+  return false;
+}
+
+// ---- v6 staging: fetch raw PNGs to flash, decode them later ----
+// The streaming design kept the TLS session, the 44 KB PNG decoder
+// and the aggregation buffers resident at the same time, and the
+// heap could not serve all three (v5.13-v5.19). v6 separates the
+// phases per 160-column strip: Phase A fetches tiles into the stage
+// area with only the decoder resident; Phase B then decodes from
+// flash - no network allocations happen while decoding.
+static uint8_t mgTmpBuf[2048];   // v6.1: stage/decode/merge scratch.
+// These phases never nest, so one static buffer serves all three -
+// as stack arrays they overflowed the 8 KB loopTask stack (on-device
+// panic: "stack overflow in task loopTask", first decode of v6).
+static uint32_t mgStageUsed = 0;          // padded bytes in the stage
+static uint32_t mgStagePrevUsed = 0;      // v6.6: bytes to re-erase pre-strip
+static uint8_t mgStageCarry[4];
+static int mgStageCarryN = 0;
+static uint32_t mgRecOff[10], mgRecLen[10];
+static int mgRecTx[10], mgRecCount = 0;
+static int mgRecTy[10]; static uint8_t mgRecLayer[10];  // v6.4 diagnostics
+static int mgDumpRec = -1;   // v6.4: record to dump on serial after a failure
+
+static bool mgStageWriteRaw(const uint8_t* data, int n) {
+  while (n > 0) {
+    int k = 4 - mgStageCarryN; if (k > n) k = n;
+    memcpy(mgStageCarry + mgStageCarryN, data, k);
+    mgStageCarryN += k; data += k; n -= k;
+    if (mgStageCarryN == 4) {
+      if (esp_partition_write(genPart, GEN_STAGE_OFF + mgStageUsed,
+                              mgStageCarry, 4) != ESP_OK)
+        return false;
+      mgStageUsed += 4;
+      mgStageCarryN = 0;
+    }
+  }
+  return true;
+}
+static bool mgStageEndRecord() {   // flush the tail, 0-padded to 4
+  if (mgStageCarryN == 0) return true;
+  while (mgStageCarryN < 4) mgStageCarry[mgStageCarryN++] = 0;
+  if (esp_partition_write(genPart, GEN_STAGE_OFF + mgStageUsed,
+                          mgStageCarry, 4) != ESP_OK)
+    return false;
+  mgStageUsed += 4;
+  mgStageCarryN = 0;
+  return true;
+}
+
+// Fetch one tile into the stage (record mgRecCount). Same TLS
+// plumbing as mgFetchTile, but the body goes to flash untouched.
+static bool mgStageTile(int z, int tx, int ty, const char* layer) {
+  char url[96];
+  snprintf(url, sizeof(url), "https://cyberjapandata.gsi.go.jp/xyz/%s/%d/%d/%d.png",
+           layer, z, tx, ty);
+  if (!mgTlsInit) { mgTls.setInsecure(); mgTlsInit = true; }
+  for (int attempt = 0; attempt < 3; attempt++) {
+    mgHttp.setReuse(true);
+    mgHttp.setTimeout(15000);
+    if (!mgHttp.begin(mgTls, url)) { mgLastHttp = -101; return false; }
+    mgHttp.addHeader("User-Agent", "MuseAPRSMap/1.0 (personal APRS viewer project)");
+    int code = mgHttp.GET();
+    if (code != 200) {
+      mgLastHttp = code;
+      mgHttp.end();
+      mgTls.stop();
+      delay(400);
+      continue;
+    }
+    uint32_t recOff = mgStageUsed;
+    int recLen = 0;
+    WiFiClient* stream = mgHttp.getStreamPtr();
+    int total = mgHttp.getSize();
+    uint8_t* buf = mgTmpBuf;   // 1024 of the shared scratch (v6.1)
+    bool ok = true;
+    uint32_t t0 = millis();
+    while (total < 0 ? mgHttp.connected() : recLen < total) {
+      size_t avail = stream->available();
+      if (avail) {
+        if (avail > 1024) avail = 1024;
+        int n = stream->readBytes(buf, avail);
+        if (n > 0) {
+          recLen += n;
+          if (!mgStageWriteRaw(buf, n)) { ok = false; break; }
+        }
+      } else {
+        delay(1);
+      }
+      if (millis() - t0 > 30000) { ok = false; break; }
+      esp_task_wdt_reset();
+    }
+    mgHttp.end();   // v8.5: per-tile session again - the v8.4 reuse
+    // path is suspected in the mid-fetch reboot; the reserve block
+    // (not reuse) is the fragmentation guard.
+    if (ok && mgStageEndRecord()) {
+      if (mgRecCount < 10) {
+        mgRecOff[mgRecCount] = recOff;
+        mgRecLen[mgRecCount] = (uint32_t)recLen;
+        mgRecTx[mgRecCount] = tx;
+        mgRecTy[mgRecCount] = 0;      // filled in by the strip loop (v6.4)
+        mgRecLayer[mgRecCount] = (layer[0] == 'b') ? 1 : 0;
+        mgRecCount++;
+      }
+      mgTilesOk++;
+      return true;
+    }
+    mgStageUsed = recOff;   // roll the partial record back
+    mgStageCarryN = 0;
+    mgHttp.end();
+    mgTls.stop();
+    delay(400);
+  }
+  return false;
+}
+
+// Decode one staged tile through pngle (mode 0 = std/sea, 1 = blank).
+static bool mgDecodeStaged(int rec, int ty, int mode) {
+  mgMode = mode;
+  mgTileOx = mgRecTx[rec] * 256;
+  mgTileOy = ty * 256;
+  if (mode == 0) memset(mgSeaBits, 0, 8192);
+  if (!genMapPtr) { mgFail = "stage mmap"; return false; }
+  pngle_reset(mgPng);
+  mgPixels = 0;
+  // v6.2: feed the tile in ONE pngle_feed call, straight from the
+  // flash mmap (chunked feeding trips a pngle boundary bug).
+  int r = pngle_feed(mgPng, genMapPtr + GEN_STAGE_OFF + mgRecOff[rec],
+                     mgRecLen[rec]);
+  esp_task_wdt_reset();
+  if (r >= 0) return true;
+  // v6.3 diagnostics: capture what the staged bytes look like via
+  // both paths, then retry the decode from esp_partition_read
+  // chunks - the retry verdict separates "bad staged bytes / ROM
+  // inflate" (retry fails too) from "mmap feed path" (retry works).
+  uint8_t mm4[4] = {0}, pr4[4] = {0};
+  memcpy(mm4, genMapPtr + GEN_STAGE_OFF + mgRecOff[rec], 4);
+  esp_partition_read(genPart, GEN_STAGE_OFF + mgRecOff[rec], pr4, 4);
+  long px1 = mgPixels;
+  pngle_reset(mgPng);
+  mgPixels = 0;
+  bool retryOk = true;
+  {
+    // BSS is too tight for a static 8 KB chunk buffer; borrow heap.
+    uint8_t* rbuf = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_DMA);
+    uint32_t ch = rbuf ? 8192 : 2048;
+    if (!rbuf) rbuf = mgTmpBuf;
+    uint32_t off = GEN_STAGE_OFF + mgRecOff[rec];
+    uint32_t left = mgRecLen[rec];
+    while (left > 0) {
+      uint32_t n = left > ch ? ch : left;
+      if (esp_partition_read(genPart, off, rbuf, n) != ESP_OK) { retryOk = false; break; }
+      if (pngle_feed(mgPng, rbuf, n) < 0) { retryOk = false; break; }
+      off += n; left -= n;
+      esp_task_wdt_reset();
+    }
+    if (rbuf != mgTmpBuf) free(rbuf);
+  }
+  snprintf(mgFailDetail, sizeof(mgFailDetail),
+           "rec%d %s %d/%d f%d px%ld len%u %02x%02x%02x%02x retry %s",
+           rec, mgRecLayer[rec] ? "blank" : "std",
+           mgRecTx[rec], mgRecTy[rec], r, px1, (unsigned)mgRecLen[rec],
+           mm4[0], mm4[1], mm4[2], mm4[3], retryOk ? "OK" : "NG");
+  return retryOk;
+}
+
+// First decode phase of a map: drop the TLS session first (its
+// buffers go back to the heap), then allocate the work buffers and
+// set up the per-map column/row weight tables.
+static bool mgPrepWorkBuffers() {
+  if (!mgWork) {
+    // v6.5: the TLS connection now stays UP across Phase B. Killing
+    // and re-establishing it per strip deterministically corrupted
+    // the first tile fetched after each reconnect (staged bytes had
+    // a genuine header, a wrong IDAT length and un-inflatable data,
+    // identical CRC on every run). The strip-sized work buffers are
+    // small enough to coexist with the live session.
+    if (!mgAllocWorkBuffers()) { mgFail = "heap (gen buffers)"; return false; }
+  }
+  mgColW = (uint16_t*)(mgWork + 0);         // 1280
+  mgRowH = mgWork + 1280;                   // 480
+  mgScrGrayRow = mgWork + 1760;             // 640
+  mgScrSeaRow = mgWork + 2400;              // 640
+  mgGrayCur = mgWork + 3040;                // 640
+  mgRingInk = mgWork + 3680;                // 1040
+  mgRingSea = mgWork + 4720;                // 1040 -> ends 5760
+  memset(mgColW, 0, 640 * 2);
+  memset(mgRowH, 0, 480);
+  for (int cx = 0; cx < mgCropW; cx++) mgColW[(int)(cx * 640.0 / mgCropW)]++;
+  for (int cy = 0; cy < mgCropH; cy++) mgRowH[(int)(cy * 480.0 / mgCropH)]++;
+  return true;
+}
+
+// ---- pass 2 helpers: classified emit from the scratch aggregates ----
+static void mgLoadRow(int r) {
+  int s = r % 13;
+  if (mgRingRow[s] == r) return;
+  esp_partition_read(genPart, GEN_SCR_GRAY + r * 640, mgScrGrayRow, 640);
+  esp_partition_read(genPart, GEN_SCR_SEA + r * 640, mgScrSeaRow, 640);
+  for (int xb = 0; xb < 80; xb++) { mgRingInk[s * 80 + xb] = 0; mgRingSea[s * 80 + xb] = 0; }
+  for (int x = 0; x < 640; x++) {
+    if (mgScrGrayRow[x] < 245)
+      mgRingInk[s * 80 + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
+    int den = mgColW[x] * mgRowH[r];
+    if (den > 0 && (int)mgScrSeaRow[x] * 100 >= 35 * den)
+      mgRingSea[s * 80 + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
+  }
+  mgRingRow[s] = r;
+}
+static inline bool mgRingBit(const uint8_t* ring, int r, int x) {
+  if (r < 0 || r >= 480 || x < 0 || x >= 640) return false;
+  mgLoadRow(r);
+  return (ring[(r % 13) * 80 + (x >> 3)] >> (7 - (x & 7))) & 1;
+}
+static bool mgCoastAt(int r, int x) {
+  if (!mgRingBit(mgRingInk, r, x)) return false;
+  for (int dy = -4; dy <= 4; dy++)
+    for (int dx = -4; dx <= 4; dx++)
+      if (mgRingBit(mgRingSea, r + dy, x + dx)) return true;
+  return false;
+}
+
+// v6.5: walk the staged records' PNG chunk structure. The poisoned
+// fetch produced records whose chunk lengths do not add up to the
+// record length, so this detects them before decoding.
+static bool mgStripRecordsValid() {
+  if (!genMapPtr) return false;
+  for (int rec = 0; rec < mgRecCount; rec++) {
+    const uint8_t* p = genMapPtr + GEN_STAGE_OFF + mgRecOff[rec];
+    uint32_t len = mgRecLen[rec];
+    if (len < 8 || memcmp(p, "\x89PNG\r\n\x1a\n", 8) != 0) return false;
+    uint32_t off = 8;
+    bool sawIend = false;
+    while (off + 8 <= len) {
+      uint32_t clen = ((uint32_t)p[off] << 24) | ((uint32_t)p[off + 1] << 16) |
+                      ((uint32_t)p[off + 2] << 8) | (uint32_t)p[off + 3];
+      if (clen > len) return false;
+      if (memcmp(p + off + 4, "IEND", 4) == 0) { sawIend = true; off += 12 + clen; break; }
+      off += 12 + clen;
+    }
+    if (!sawIend || off != len) return false;
+  }
+  return true;
+}
+
+static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z, uint32_t dataOff, uint32_t* sumOut) {
+  mgStripNo = 0;   // v8.6
+  double x0 = mgGx(b[2], z), x1 = mgGx(b[3], z);
+  double y0 = mgGy(b[0], z), y1 = mgGy(b[1], z);
+  mgCropW = (int)lround(x1 - x0);
+  mgCropH = (int)lround(y1 - y0);
+  mgCropX0 = (int)floor(x0);
+  mgCropY0 = (int)floor(y0);
+  if (mgCropW < 64 || mgCropH < 64) { mgFail = "crop size"; return false; }
+  int tx0 = mgCropX0 >> 8, tx1 = (mgCropX0 + mgCropW - 1) >> 8;
+  int ty0 = mgCropY0 >> 8, ty1 = (mgCropY0 + mgCropH - 1) >> 8;
+  // (the work buffers, pointer carve and weight tables are set up by
+  // mgPrepWorkBuffers() at the first decode phase - v6)
+  // v6.6: NOR flash can only clear bits (1->0) when programming;
+  // writing over a programmed cell yields old AND new. Every reused
+  // region must be ERASED before rewriting - the old zero-write of
+  // the sea scratch would have ANDed every later sea value to 0.
+  // Both scratches are erased here, once per map, and pass 1 writes
+  // each scratch row exactly once (RAM row staging below).
+  for (uint32_t off = 0; off < 614400; off += 65536) {
+    uint32_t n = 614400 - off > 65536 ? 65536 : 614400 - off;
+    esp_partition_erase_range(genPart, GEN_SCR_OFF + off, n);
+    esp_task_wdt_reset();
+  }
+  char l2[48];
+  for (int ty = ty0; ty <= ty1; ty++) {
+    int cyB0 = ty * 256 - mgCropY0; if (cyB0 < 0) cyB0 = 0;
+    int cyB1 = ty * 256 + 255 - mgCropY0; if (cyB1 > mgCropH - 1) cyB1 = mgCropH - 1;
+    if (cyB1 < cyB0) continue;
+    int bandOy0 = (int)(cyB0 * 480.0 / mgCropH);
+    int oyB = (int)(cyB1 * 480.0 / mgCropH);
+    int bandRowsFull = oyB - bandOy0 + 1;
+    for (int sb = 0; sb < bandRowsFull; sb += 40) {
+      mgBandOy0 = bandOy0 + sb;
+      mgBandRows = bandRowsFull - sb; if (mgBandRows > 40) mgBandRows = 40;
+      // (v6.9: no RAM row accumulators - the merge writes flash)
+      // v6: process the sub-band in 160-column strips. Phase A stages
+      // the strip's raw tiles in flash; Phase B decodes them. The two
+      // phases never hold their big allocations at the same time.
+      for (int sx0 = 0; sx0 < 640; sx0 += 160) {
+        mgStripX0 = sx0;
+        mgStripNo++; mgCkpt = ((uint32_t)(mi + 1) << 24) | ((uint32_t)(mgStripNo & 0xFFFF) << 8) | 1;   // v8.6
+        int inX0 = mgCropX0 + (int)(sx0 * (double)mgCropW / 640);
+        int inX1 = mgCropX0 + (int)((sx0 + 160) * (double)mgCropW / 640);
+        int txA = inX0 >> 8; if (txA < tx0) txA = tx0;
+        int txB = (inX1 - 1) >> 8; if (txB > tx1) txB = tx1;
+        // ---- Phase A: fetch this strip's tiles into the stage ----
+        // v8.3: up to 3 attempts per strip. v8.2 died at 99% on one
+        // late transient fetch failure (http -1, tiles 308); a strip
+        // now restages after a pause instead of aborting the run.
+        bool ok = false;
+        mgFailDetail[0] = 0;   // v8.5: detail belongs to this strip
+        for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+          if (attempt > 1) {
+            mgHttp.end(); mgTls.stop();
+            mgShow("Fetch failed - retrying", "",
+                   (mgBandOy0 + mgBandRows) * 85 / 480);
+            delay(4000 * attempt);
+            esp_task_wdt_reset();
+            mgStagePrevUsed = mgStageUsed;   // erase partial stage
+          }
+          // v6.6: erase what the previous strip/attempt left in the
+          // stage - programming over programmed cells ANDs old and
+          // new bytes (the deterministic "tile decode" corruption).
+          if (mgStagePrevUsed) {
+            uint32_t eb = (mgStagePrevUsed + 4095) & ~4095u;
+            for (uint32_t o = 0; o < eb; o += 65536) {
+              uint32_t n = eb - o > 65536 ? 65536 : eb - o;
+              esp_partition_erase_range(genPart, GEN_STAGE_OFF + o, n);
+              esp_task_wdt_reset();
+            }
+            mgStagePrevUsed = 0;
+          }
+          mgStageUsed = 0; mgStageCarryN = 0; mgRecCount = 0;
+          ok = true;
+          for (int tx = txA; tx <= txB && ok; tx++) {
+            if (mgStageUsed > (genPart->size - GEN_STAGE_OFF) - 131072) {
+              mgFail = "stage full"; return false;
+            }
+            ok = mgStageTile(z, tx, ty, "std") && mgStageTile(z, tx, ty, "blank");
+          }
+          // v6.5: if a staged record's chunk structure is broken,
+          // hard-reset the connection and refetch the strip once.
+          if (ok && !mgStripRecordsValid()) {
+            mgHttp.end();
+            mgTls.stop();
+            delay(300);
+            {   // v6.6: erase the invalid records before restaging
+              uint32_t eb = (mgStageUsed + 4095) & ~4095u;
+              for (uint32_t o = 0; o < eb; o += 65536) {
+                uint32_t n = eb - o > 65536 ? 65536 : eb - o;
+                esp_partition_erase_range(genPart, GEN_STAGE_OFF + o, n);
+                esp_task_wdt_reset();
+              }
+            }
+            mgStageUsed = 0; mgStageCarryN = 0; mgRecCount = 0;
+            for (int tx = txA; tx <= txB && ok; tx++) {
+              ok = mgStageTile(z, tx, ty, "std") && mgStageTile(z, tx, ty, "blank");
+            }
+            if (ok) for (int r2 = 0; r2 < mgRecCount; r2++) mgRecTy[r2] = ty;
+            if (ok && !mgStripRecordsValid()) {   // v8.3: failed attempt
+              ok = false;
+              if (!mgFailDetail[0])
+                snprintf(mgFailDetail, sizeof(mgFailDetail),
+                         "z%d ty%d sx%d bad record heap %u", z, ty, sx0,
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+            }
+          }
+        }
+        snprintf(l2, sizeof(l2), "map %d/2 rows %d/480 heap %u", mi + 1, mgBandOy0 + mgBandRows,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        mgShow(mi == 0 ? "APRS map (narrow area)" : "FLIGHT/AIS map (wide area)",
+               l2, (mgBandOy0 + mgBandRows) * 85 / 480);
+        if (!ok) { mgFail = "tile fetch"; return false; }
+        for (int r2 = 0; r2 < mgRecCount; r2++) mgRecTy[r2] = ty;   // v6.4
+        mgCkpt = ((uint32_t)(mi + 1) << 24) | ((uint32_t)(mgStripNo & 0xFFFF) << 8) | 2;   // v8.6
+        // ---- Phase B: decode the staged tiles into the aggregates ----
+        // v8.7: try the work set with the TLS session still up;
+        // only if it does not fit, drop the session and retry
+        // the allocation once (kept as a fallback).
+        if (!mgPrepWorkBuffers()) {
+          mgHttp.end(); mgTls.stop();
+          if (!mgPrepWorkBuffers()) return false;
+        }
+        memset(mgAggGray, 0xFF, 160 * mgBandRows);
+        memset(mgAggSea, 0, 160 * mgBandRows);
+        for (int rec = 0; rec < mgRecCount; rec++) {
+          if (!mgDecodeStaged(rec, ty, (rec & 1) ? 1 : 0)) {
+            mgFail = "tile decode"; mgDumpRec = rec; return false;
+          }
+        }
+        // v6.9: merge this strip's columns into the flash scratch.
+        // AND-safety: strips own disjoint column ranges, so each
+        // scratch cell is programmed with its final value exactly
+        // once per map; other strips rewrite the bytes they read
+        // unchanged (AND(v,v) = v). The sea baseline is the erased
+        // 0xFF read as 0 - a zero-WRITE init would AND every sea
+        // count to 0, which is why v6.6's RAM accumulators existed;
+        // they are gone again (their 20 KB broke the heap budget).
+        for (int lo = 0; lo < mgBandRows; lo++) {
+          int oy = mgBandOy0 + lo;
+          uint8_t* rowG = mgTmpBuf;          // shared scratch,
+          uint8_t* rowS = mgTmpBuf + 640;    // not stack arrays
+          esp_partition_read(genPart, GEN_SCR_GRAY + oy * 640, rowG, 640);
+          esp_partition_read(genPart, GEN_SCR_SEA + oy * 640, rowS, 640);
+          for (int x = sx0; x < sx0 + 160; x++) {
+            int ai = lo * 160 + (x - sx0);
+            if (mgAggGray[ai] < rowG[x]) rowG[x] = mgAggGray[ai];
+            int base = rowS[x] == 0xFF ? 0 : rowS[x];
+            int sv = base + mgAggSea[ai];
+            rowS[x] = (uint8_t)(sv > 255 ? 255 : sv);
+          }
+          esp_partition_write(genPart, GEN_SCR_GRAY + oy * 640, rowG, 640);
+          esp_partition_write(genPart, GEN_SCR_SEA + oy * 640, rowS, 640);
+        }
+        mgStagePrevUsed = mgStageUsed;   // v6.6: re-erase next strip
+        mgFreeWorkBuffers();   // v7.1: Phase A gets a clean heap
+        esp_task_wdt_reset();
+      }
+    }
+  }
+
+  // ---- pass 2: classify + pack + store ----
+  mgCkpt = ((uint32_t)(mi + 1) << 24) | 3;   // v8.6
+  // v8.1: v7.1+ frees the work buffers at each strip end; pass 2
+  // uses mgWork's carve (mgGrayCur, rings), so re-acquire it here.
+  if (!mgPrepWorkBuffers()) return false;
+  for (int i = 0; i < 13; i++) mgRingRow[i] = -1;
+  uint32_t sum = 0;
+  for (int r = 0; r < 480; r++) {
+    esp_partition_read(genPart, GEN_SCR_GRAY + r * 640, mgGrayCur, 640);
+    uint8_t grayRow[320], classRow[80];
+    memset(classRow, 0, sizeof(classRow));
+    for (int x = 0; x < 640; x++) {
+      bool ink = mgRingBit(mgRingInk, r, x);
+      bool coast = ink && mgCoastAt(r, x);
+      bool grown = false;
+      if (!ink) {
+        for (int dy = -1; dy <= 1 && !grown; dy++)
+          for (int dx = -1; dx <= 1 && !grown; dx++)
+            if ((dx || dy) && mgCoastAt(r + dy, x + dx)) grown = true;
+      }
+      if (coast || grown)
+        classRow[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+      int g = mgGrayCur[x];
+      if (grown) g = 110;
+      int gd = 255 - (255 - g) * 16 / 10;
+      if (gd < 0) gd = 0;
+      int nib = gd >> 4;
+      if (x & 1) grayRow[x >> 1] |= (uint8_t)nib;
+      else grayRow[x >> 1] = (uint8_t)(nib << 4);
+    }
+    esp_partition_write(genPart, dataOff + r * 320, grayRow, 320);
+    esp_partition_write(genPart, dataOff + 153600 + r * 80, classRow, 80);
+    for (int i = 0; i < 320; i++) sum += grayRow[i];
+    for (int i = 0; i < 80; i++) sum += classRow[i];
+    if ((r & 31) == 0) {
+      mgShow("Classifying coastlines...", "", 85 + r * 15 / 480);
+      esp_task_wdt_reset();
+    }
+  }
+  *sumOut = sum;
+  mgFreeWorkBuffers();   // v8.6: was kept allocated into the next
+  // map, whose fetches then faced a resident 34 KB work set
+  return true;
+}
+
+static bool __attribute__((noinline)) mgGenerate() {
+  mgStagePrevUsed = 0;   // v6.6: full erase below covers the first strip
+  // Bounds relative to home, mirroring the Takamatsu layout of
+  // make_maps.py (map1 z11 narrow, map2 z10 wide).
+  static const double OFF[2][4] = {
+    { +0.2599, -0.4401, -0.9401, +0.8566 },   // APRS:   N S W E
+    { +1.0599, -0.4401, -0.7934, +0.9066 },   // FLIGHT: N S W E
+  };
+  static const int ZS[2] = { 11, 10 };
+  double b[2][4];
+  for (int i = 0; i < 2; i++) {
+    b[i][0] = homeLat + OFF[i][0];
+    b[i][1] = homeLat + OFF[i][1];
+    b[i][2] = homeLon + OFF[i][2];
+    b[i][3] = homeLon + OFF[i][3];
+  }
+  // v6: the PNG decoder is allocated HERE - the config server is
+  // stopped and no TLS session exists yet, the emptiest heap of the
+  // boot (the standalone diagnostic reached GSI with ~110 KB free in
+  // these conditions). The work buffers come later still, at the
+  // first decode phase, after the TLS session is dropped.
+  if (!mgAllocPng()) { mgFail = "heap (gen buffers)"; return false; }
+  mgShow("Erasing map area...", "", 1);
+  // Erase in 64 KB chunks and feed the task watchdog: one blocking
+  // erase of ~2 MB takes tens of seconds and trips the WDT (v5.5 bug).
+  // v6: the erase covers the tile stage area as well.
+  for (uint32_t off = 0; off < genPart->size; off += 0x10000) {
+    uint32_t n = genPart->size - off; if (n > 0x10000) n = 0x10000;
+    if (esp_partition_erase_range(genPart, off, n) != ESP_OK) { mgFail = "flash erase"; return false; }
+    esp_task_wdt_reset();
+    mgShow("Erasing map area...", "", 1 + (int)(off * 4 / genPart->size));
+  }
+  if (!genMapPtr) {   // v6.2: decode reads the stage through the mmap
+    if (esp_partition_mmap(genPart, 0, genPart->size, SPI_FLASH_MMAP_DATA,
+                           (const void**)&genMapPtr, &genMmapH) != ESP_OK) {
+      mgFail = "stage mmap"; return false;
+    }
+  }
+  uint32_t sums[2] = { 0, 0 };
+  for (int i = 0; i < 2; i++)
+    if (!mgOneMap(i, b[i], ZS[i], GEN_HDR_BYTES + i * GEN_MAP_BYTES, &sums[i]))
+      return false;
+  GenHeader h = {};
+  h.magic = GEN_MAGIC;
+  h.ver = 1;
+  h.homeLat = homeLat;
+  h.homeLon = homeLon;
+  memcpy(h.b, b, sizeof(b));
+  h.sum[0] = sums[0];
+  h.sum[1] = sums[1];
+  mgShow("Done", "", 100);
+  if (esp_partition_write(genPart, 0, &h, sizeof(h)) != ESP_OK) { mgFail = "header write"; return false; }
+  return true;
+}
+
+static char mgActFail[64] = "";   // v8.1: why the last activate failed
+static bool mgActivate() {
+  if (!genPart) { snprintf(mgActFail, sizeof(mgActFail), "no partition"); return false; }
+  if (!genMapPtr) {
+    if (esp_partition_mmap(genPart, 0, genPart->size, SPI_FLASH_MMAP_DATA,
+                           (const void**)&genMapPtr, &genMmapH) != ESP_OK)
+      { snprintf(mgActFail, sizeof(mgActFail), "mmap failed"); return false; }
+  }
+  const GenHeader* h = (const GenHeader*)genMapPtr;
+  if (h->magic != GEN_MAGIC || h->ver != 1) {
+    snprintf(mgActFail, sizeof(mgActFail), "bad magic/ver %08x/%d",
+             (unsigned)h->magic, (int)h->ver);
+    Serial.printf("MAPGEN activate: %s\n", mgActFail);
+    return false;
+  }
+  if (fabs(h->homeLat - homeLat) > 0.01 || fabs(h->homeLon - homeLon) > 0.01) {
+    snprintf(mgActFail, sizeof(mgActFail),
+             "centre hdr %.4f,%.4f vs cur %.4f,%.4f",
+             h->homeLat, h->homeLon, homeLat, homeLon);
+    Serial.printf("MAPGEN activate: %s\n", mgActFail);
+    return false;
+  }
+  for (int i = 0; i < 2; i++) {
+    const uint8_t* base = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
+    uint32_t s = 0;
+    for (int k = 0; k < GEN_MAP_BYTES; k++) s += base[k];
+    if (s != h->sum[i]) {
+      snprintf(mgActFail, sizeof(mgActFail),
+               "map %d sum flash %u vs hdr %u", i, (unsigned)s, (unsigned)h->sum[i]);
+      Serial.printf("MAPGEN activate: %s\n", mgActFail);
+      return false;
+    }
+  }
+  mgActFail[0] = 0;
+  for (int i = 0; i < 2; i++) {
+    mapGrayPtr[i] = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
+    mapClassPtr[i] = mapGrayPtr[i] + 153600;
+    MAP_LIST[i].north = h->b[i][0];
+    MAP_LIST[i].south = h->b[i][1];
+    MAP_LIST[i].west = h->b[i][2];
+    MAP_LIST[i].east = h->b[i][3];
+  }
+  genMapsActive = true;
+  return true;
+}
+
+static void handleMapGen();   // portal handler, defined in the portal section
+
+// v5.19: ALL generation buffers are allocated in setup() BEFORE
+// Wi-Fi starts (pristine heap). Allocating them inside mgGenerate(),
+// after the TLS warm-up, failed deterministically in v5.16-v5.18:
+// the warm-up handshake succeeded (http 0), but a 10 KB aggregate
+// malloc then found no hole next to the live TLS session and the
+// 44 KB decoder (post-cleanup largest block read 42,996 every time).
+static bool mgAllocPng() {
+  if (mgPng) return true;
+  void* pb = heap_caps_calloc(1, PNGLE_T_SIZE, MALLOC_CAP_DMA);
+  if (!pb) return false;
+  mgPng = (pngle_t*)pb;
+  pngle_reset(mgPng);
+  pngle_set_draw_callback(mgPng, mgDrawCb);
+  return true;
+}
+// v6: work buffers live only from the first decode phase on, and the
+// aggregates are one 160-column strip wide (2,560 B each, not 10 KB).
+static bool mgAllocWorkBuffers() {
+  // v6.9: back to the buffer set v6.5 proved on-device (19,072 B).
+  // The 20 KB of RAM row accumulators (v6.6-v6.8) never fit the
+  // heap alongside the live TLS session + pngle, in any arrangement.
+  if (!mgSeaBits) mgSeaBits = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_DMA);
+  if (!mgWork) mgWork = (uint8_t*)heap_caps_malloc(5760, MALLOC_CAP_DMA);
+  if (!mgAggGray) mgAggGray = (uint8_t*)heap_caps_malloc(160 * 40, MALLOC_CAP_DMA);
+  if (!mgAggSea) mgAggSea = (uint8_t*)heap_caps_malloc(160 * 40, MALLOC_CAP_DMA);
+  return mgAggGray && mgAggSea && mgSeaBits && mgWork;
+}
+// v7.1: the work buffers live only inside Phase B of each strip.
+// Freeing them before every Phase A keeps the heap in the proven
+// "pngle only" state for TLS handshakes - with the 32-row
+// aggregates resident (24 KB), a retry handshake after a dropped
+// connection failed with http -1 (v7.0, tiles 14).
+static void mgFreeWorkBuffers() {
+  if (mgAggGray) { free(mgAggGray); mgAggGray = nullptr; }
+  if (mgAggSea) { free(mgAggSea); mgAggSea = nullptr; }
+  if (mgSeaBits) { free(mgSeaBits); mgSeaBits = nullptr; }
+  if (mgWork) { free(mgWork); mgWork = nullptr; }
+}
+
+static void mgFreeGenBuffers() {
+  if (mgPng) { free(mgPng); mgPng = nullptr; }
+  if (mgAggGray) { free(mgAggGray); mgAggGray = nullptr; }
+  if (mgAggSea) { free(mgAggSea); mgAggSea = nullptr; }
+  if (mgSeaBits) { free(mgSeaBits); mgSeaBits = nullptr; }
+  if (mgWork) { free(mgWork); mgWork = nullptr; }
+}
+
+extern "C" unsigned long mz_crc32(unsigned long crc,
+                                  const unsigned char* ptr, size_t buf_len);
+static void mgDumpFailed() {
+  if (mgDumpRec < 0 || !genPart) return;
+  int rec = mgDumpRec;
+  uint32_t off = GEN_STAGE_OFF + mgRecOff[rec], len = mgRecLen[rec];
+  uint32_t crc = 0;
+  {
+    uint32_t o = off, left = len;
+    while (left > 0) {
+      uint32_t n = left > 2048 ? 2048 : left;
+      if (esp_partition_read(genPart, o, mgTmpBuf, n) != ESP_OK) break;
+      crc = mz_crc32(crc, mgTmpBuf, n);
+      o += n; left -= n;
+    }
+  }
+  Serial.printf("DUMP rec%d %s tx%d ty%d len%u crc %08x\n",
+                rec, mgRecLayer[rec] ? "blank" : "std",
+                mgRecTx[rec], mgRecTy[rec], (unsigned)len, (unsigned)crc);
+  static const char B64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  uint32_t dn = len < 4096 ? len : 4096;
+  Serial.println("DUMP-DATA-BEGIN");
+  for (uint32_t i = 0; i < dn; i += 3) {
+    uint8_t b[3] = {0, 0, 0};
+    uint32_t got = 0;
+    for (uint32_t k = 0; k < 3 && i + k < dn; k++) {
+      if (esp_partition_read(genPart, off + i + k, &b[k], 1) == ESP_OK) got++;
+    }
+    char out[5];
+    out[0] = B64[b[0] >> 2];
+    out[1] = B64[((b[0] & 3) << 4) | (b[1] >> 4)];
+    out[2] = got > 1 ? B64[((b[1] & 15) << 2) | (b[2] >> 6)] : '=';
+    out[3] = got > 2 ? B64[b[2] & 63] : '=';
+    out[4] = 0;
+    Serial.print(out);
+    if (((i / 3) + 1) % 19 == 0) Serial.println();
+  }
+  Serial.println();
+  Serial.println("DUMP-DATA-END");
+  Serial.flush();
+}
+
+static void __attribute__((noinline)) mapGenBoot() {
+  genPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                     ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "mapdata");
+  if (!genPart) {
+    Serial.println("MAPGEN: no mapdata partition - baked maps only");
+    return;
+  }
+  if (mgCkpt) {   // v8.6: a hard reset interrupted the last run
+    static char cl[64];
+    snprintf(cl, sizeof(cl), "reset %d at map %d strip %d phase %d",
+             (int)esp_reset_reason(), (int)(mgCkpt >> 24),
+             (int)((mgCkpt >> 8) & 0xFFFF), (int)(mgCkpt & 0xFF));
+    Serial.printf("MAPGEN interrupted: %s\n", cl);
+    mgShow("Reset during generation", cl, 0);
+    delay(9000);
+    mgCkpt = 0;
+  }
+  bool force = false;
+  {
+    Preferences p;
+    if (p.begin("aprsmap", false)) {
+      force = p.getBool("mgforce", false);
+      if (force) p.putBool("mgforce", false);
+      p.end();
+    }
+  }
+  if (!force && mgActivate()) {
+    Serial.println("MAPGEN: generated maps active");
+    return;
+  }
+  if (!force && mgActFail[0]) {   // v8.2: verdict on the LCD too
+    mgShow("Stored map rejected", mgActFail, 0);
+    delay(6000);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("MAPGEN: offline - baked maps for now");
+    return;
+  }
+  Serial.println("MAPGEN: generating maps for the configured centre...");
+  cfgServer.stop();          // v5.16: free every heap byte for the
+  MDNS.end();                // TLS handshake (see mgGenerate)
+  delay(100);
+  bool genOk = mgGenerate();
+  mgCkpt = 0;   // v8.6: only a hard reset leaves it set
+  mgHttp.end();                 // v6.5: session's job is done
+  mgTls.stop();
+  if (!genOk) mgDumpFailed();   // v6.4: serial dump of the bad record
+  mgFreeGenBuffers();   // hand the heap back to normal operation
+  cfgServer.begin();
+  MDNS.begin("aprs-map");
+  if (genOk && mgActivate()) {
+    Serial.println("MAPGEN: generation complete");
+    mgShow("Map generation complete", "", 100);
+    delay(1200);
+  } else {
+    Serial.println("MAPGEN: generation FAILED - baked maps");
+    { static char fl[48], fl2[64];
+      if (!mgFail[0]) mgFail = "activate check";
+      snprintf(fl, sizeof(fl), "FAILED: %s", mgFail);
+      if (mgFailDetail[0]) {
+        snprintf(fl2, sizeof(fl2), "%s", mgFailDetail);
+      } else {
+        snprintf(fl2, sizeof(fl2), "heap %u http %d tiles %d [button]",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                 mgLastHttp, mgTilesOk);
+      }
+      mgShow(fl, fl2, 0);
+      // v5.10: keep the diagnosis on screen until a button is pressed
+      uint32_t ft0 = millis();
+      while (millis() - ft0 < 120000) {
+        if (digitalRead(BTN_A_PIN) == LOW || digitalRead(BTN_B_PIN) == LOW ||
+            digitalRead(BTN_C_PIN) == LOW) break;
+        delay(50);
+      } }
+    delay(2000);
+  }
+}
 
 struct BmpInfo { bool ok = false; int w = 0, h = 0; uint32_t dataOff = 0; int rowSize = 0; bool topDown = false; };
 static BmpInfo bmpInfo[MAP_COUNT];
@@ -660,7 +1618,7 @@ static void emitLine(int y) {
 // card is used. Downscaling averages the source footprint and upscaling
 // uses bilinear interpolation, so lines stay smooth and anti-aliased.
 static inline int mapGrayAt(int sx, int sy) {
-  const uint8_t* m = MAP_GRAY[curMap];
+  const uint8_t* m = mapGrayPtr[curMap];
   uint8_t b = m[sy * MAP_ROW_BYTES + (sx >> 1)];
   return ((sx & 1) ? (b & 0x0F) : (b >> 4)) * 17;   // 0 = line .. 255 = paper
 }
@@ -670,7 +1628,7 @@ static inline int mapGrayAt(int sx, int sy) {
 // standard tiles' sea mask.
 static inline bool mapCoastAt(int sx, int sy) {
   int i = sy * MAP_W + sx;
-  return (MAP_CLASS[curMap][i >> 3] >> (7 - (i & 7))) & 1;
+  return (mapClassPtr[curMap][i >> 3] >> (7 - (i & 7))) & 1;
 }
 
 // Dark theme palettes by line class (user request): coastlines white,
@@ -762,7 +1720,7 @@ static uint16_t mapPixelAt(int x, int y) {
 
 static void drawMap() {
   if (!mapChunk)   // freed before each ADS-B fetch to give TLS the heap
-    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);   // IRAM placement of this buffer caused the v76/v3-style LoadStoreError reboots
   if (!inkPalInit) initInkPal();
   computeView();
   vImgRows = (int)lround(vSrcH * vScale);
@@ -2069,9 +3027,10 @@ static bool sendAisSubscription() {
   // Bounds of MAP_LIST[1] (the Flight/AIS map), as [lat, lon] pairs.
   char sub[320];
   snprintf(sub, sizeof(sub),
-    "{\"APIKey\":\"%s\",\"BoundingBoxes\":[[[33.90,133.25],[35.40,134.95]]],"
+    "{\"APIKey\":\"%s\",\"BoundingBoxes\":[[[%.4f,%.4f],[%.4f,%.4f]]],"
     "\"FilterMessageTypes\":[\"PositionReport\",\"ShipStaticData\"]}",
-    cfgAisKey.c_str());
+    cfgAisKey.c_str(), MAP_LIST[1].south, MAP_LIST[1].west,
+    MAP_LIST[1].north, MAP_LIST[1].east);
   aisLastSubMs = millis();
   return wsSendFrame(0x1, (const uint8_t*)sub, strlen(sub));
 }
@@ -2615,7 +3574,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v4");
+  tft.print("APRS Map Viewer M5 v8.8");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -2652,6 +3611,23 @@ void setup() {
     bmpInfo[i].topDown = true;
   }
   sdOk = true;   // legacy flag: now means "maps available"
+  // (mode centres are initialised after mapGenBoot(), once the final
+  // map bounds - baked or generated - are known)
+  // (no frame sprite on this board - see the composition note at G)
+
+  // Phone-based setup (Plane Radar style): settings live in NVS and
+  // config.h is only the factory default. Holding BtnB for 2 s after
+  // the splash wipes them and forces the setup portal + help screen.
+  // v6: nothing generation-related is allocated in setup(); the
+  // decoder and work buffers are allocated inside mgGenerate() /
+  // mgOneMap() at the moments the heap can serve them.
+  loadSettings(false);
+  bool forcePortal = bootResetWindow();
+  if (forcePortal) loadSettings(true);
+  wifiPhase(forcePortal);
+
+  mapGenBoot();   // v5: activate generated maps, or generate them first
+  mgFreeGenBuffers();   // v5.19: covers mapGenBoot's early returns
   for (int i = 0; i < MODE_COUNT; i++) {
     const MapDef& mm = MAP_LIST[MODE_MAP[i]];
     modeCenterLat[i] = (mm.north + mm.south) / 2;
@@ -2661,15 +3637,6 @@ void setup() {
   centerLat = modeCenterLat[0];
   centerLon = modeCenterLon[0];
   zoomLevel = modeZoom[0];
-  // (no frame sprite on this board - see the composition note at G)
-
-  // Phone-based setup (Plane Radar style): settings live in NVS and
-  // config.h is only the factory default. Holding BtnB for 2 s after
-  // the splash wipes them and forces the setup portal + help screen.
-  loadSettings(false);
-  bool forcePortal = bootResetWindow();
-  if (forcePortal) loadSettings(true);
-  wifiPhase(forcePortal);
 
   aprsSetup();
   redraw();
