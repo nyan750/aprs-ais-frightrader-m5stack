@@ -8,10 +8,11 @@ ESP32-2432S028（CYD）版 v78 から移植したもので、タッチ操作を 
 <img src="aprs.jpg" width="480">
 
 ## 画面
-
+| 
 | 画面 | 地図 | 内容 |
-
-AIS 船舶（aisstream.io、APIキーが必要） |
+A ボタン　aprs 範囲内のaprs局の表示
+B ボタン　frightrader 範囲内の飛行中の航空機を表示
+C ボタン　AIS 付近を航行中の船舶（aisstream.io、APIキーが必要） |
 
 地図はファームウェアに内蔵しているため、SDカードは不要です。
 
