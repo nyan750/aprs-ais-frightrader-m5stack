@@ -566,7 +566,7 @@ static uint32_t packetCount = 0;
 // ---------------- view ----------------
 static int    curMap = 0;
 static double centerLat = homeLat, centerLon = homeLon;
-static int    zoomLevel = 0;               // 0 = whole BMP fits the screen, +1 per x2 step (scale capped at x4)
+static int    zoomLevel = 0;               // v8.12: 0 = x1 (whole map), 1 = x1.5 - toggled
 static int    selected = -1;               // index into stations[]
 static bool   detailOpen = false;
 // Three screens (user request): APRS stations, Flight (aircraft) and
@@ -674,6 +674,7 @@ static uint8_t* mgWork = nullptr;
 static const char* mgFail = "";    // last generation failure step
 static pngle_t* mgPng = nullptr;   // persistent decoder (allocated in setup)
 static bool mgAllocPng();          // v6: defined near mapGenBoot
+static int mgRangeKm();            // v8.13: defined near mgActivate
 static bool mgAllocWorkBuffers();
 static void mgFreeWorkBuffers();   // v7.1 forward declaration
 // v5.17: aggregates are two separate 10 KB allocations (mgAggGray/Sea)
@@ -1255,13 +1256,24 @@ static bool __attribute__((noinline)) mgGenerate() {
     { +0.2599, -0.4401, -0.9401, +0.8566 },   // APRS:   N S W E
     { +1.0599, -0.4401, -0.7934, +0.9066 },   // FLIGHT: N S W E
   };
-  static const int ZS[2] = { 11, 10 };
+  // v8.13: the extent follows the configured range - the 100 km
+  // layout above scaled by range/100 - and the tile zoom is chosen
+  // per map so the source size stays near the proven ~2600 / ~1300 px
+  // (reproduces z11 / z10 exactly at 100 km).
+  static const double SRC_TARGET[2] = { 2600, 1300 };
+  double sc = mgRangeKm() / 100.0;
   double b[2][4];
+  int ZS[2];
   for (int i = 0; i < 2; i++) {
-    b[i][0] = homeLat + OFF[i][0];
-    b[i][1] = homeLat + OFF[i][1];
-    b[i][2] = homeLon + OFF[i][2];
-    b[i][3] = homeLon + OFF[i][3];
+    b[i][0] = homeLat + OFF[i][0] * sc;
+    b[i][1] = homeLat + OFF[i][1] * sc;
+    b[i][2] = homeLon + OFF[i][2] * sc;
+    b[i][3] = homeLon + OFF[i][3] * sc;
+    double lonSpan = b[i][3] - b[i][2];
+    int z = (int)lround(log2(SRC_TARGET[i] * 360.0 / (256.0 * lonSpan)));
+    if (z < 9) z = 9;
+    if (z > 14) z = 14;
+    ZS[i] = z;
   }
   // v6: the PNG decoder is allocated HERE - the config server is
   // stopped and no TLS session exists yet, the emptiest heap of the
@@ -1297,12 +1309,22 @@ static bool __attribute__((noinline)) mgGenerate() {
   memcpy(h.b, b, sizeof(b));
   h.sum[0] = sums[0];
   h.sum[1] = sums[1];
+  h.reserved[0] = (uint32_t)mgRangeKm();   // v8.13: range this map was made for
   mgShow("Done", "", 100);
   if (esp_partition_write(genPart, 0, &h, sizeof(h)) != ESP_OK) { mgFail = "header write"; return false; }
   return true;
 }
 
 static char mgActFail[64] = "";   // v8.1: why the last activate failed
+static int mgHdrRangeKm = 100;    // v8.13: range stored in the map header
+// v8.13: one clamped view of the configured range, used for the map
+// geometry, the header stamp and the boot-time comparison alike.
+static int mgRangeKm() {
+  int r = cfgRangeKm;
+  if (r < 10) r = 10;
+  if (r > 500) r = 500;
+  return r;
+}
 static bool mgActivate() {
   if (!genPart) { snprintf(mgActFail, sizeof(mgActFail), "no partition"); return false; }
   if (!genMapPtr) {
@@ -1336,6 +1358,7 @@ static bool mgActivate() {
     }
   }
   mgActFail[0] = 0;
+  mgHdrRangeKm = h->reserved[0] ? (int)h->reserved[0] : 100;   // v8.13
   for (int i = 0; i < 2; i++) {
     mapGrayPtr[i] = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
     mapClassPtr[i] = mapGrayPtr[i] + 153600;
@@ -1467,8 +1490,15 @@ static void __attribute__((noinline)) mapGenBoot() {
     }
   }
   if (!force && mgActivate()) {
-    Serial.println("MAPGEN: generated maps active");
-    return;
+    if (mgHdrRangeKm == mgRangeKm()) {
+      Serial.println("MAPGEN: generated maps active");
+      return;
+    }
+    // v8.13: the range changed since this map was generated - reject
+    // it (reason shown below) and fall through to regeneration.
+    snprintf(mgActFail, sizeof(mgActFail), "range hdr %d km vs cur %d km",
+             mgHdrRangeKm, mgRangeKm());
+    Serial.printf("MAPGEN activate: %s\n", mgActFail);
   }
   if (!force && mgActFail[0]) {   // v8.2: verdict on the LCD too
     mgShow("Stored map rejected", mgActFail, 0);
@@ -1528,15 +1558,8 @@ static void computeView() {
   int h = bi.ok ? bi.h : 240;
   double fit = min(320.0 / w, 240.0 / h);
   double s;
-  if (curMap == 0) {   // APRS screen zoom table (user request)
-    static const double APRS_SCALES[7] = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5};
-    int li = zoomLevel; if (li < 0) li = 0; if (li > 6) li = 6;
-    s = APRS_SCALES[li];
-  } else {             // Flight screen: doubling zoom
-    s = fit;
-    for (int i = 0; i < zoomLevel; i++) s *= 2;
-    if (s > 4.0) s = 4.0;
-  }
+  // v8.12: x1 = the whole map on screen, x1.5 = 1.5x that (toggle)
+  s = fit * (zoomLevel ? 1.5 : 1.0);
   vScale = s;
   vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
   vSrcH = 240.0 / s; if (vSrcH > h) vSrcH = h;
@@ -1573,10 +1596,10 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
 // map1 (all of Kagawa) is what you see first. Zoom in with [+] / station taps.
 static int maxZoomLevel() {
-  return screenMode == 0 ? 6 : 3;   // APRS has 7 levels (x0.5..x3.5), Flight 4
+  return 1;   // v8.9: two zoom states only (x1 / x1.5), toggled
 }
 static int defaultZoomLevel() {
-  return screenMode == 0 ? 1 : 0;   // APRS opens at x1, Flight at the fit view
+  return 0;   // every screen opens at x1 (APRS) / the fit view
 }
 
 static uint16_t rowPixBuf[320];
@@ -1648,14 +1671,16 @@ static void initInkPal() {
     // old cyan report became unnecessary once the pushImage colour
     // rotation was fixed in v56, and on the thinned v59 line its
     // mid-tones read as pink - user report.)
-    int wd = (int)(255.0f * powf(d / 255.0f, 0.65f));
+    int dd = (int)(255.0f * powf(d / 255.0f, 1.35f));   // v8.10: thinner lines
+    int wd = (int)(255.0f * powf(dd / 255.0f, 0.65f));
     int r = 10 + wd * (255 - 10) / 255;
     int g = 12 + wd * (255 - 12) / 255;
     int b = 16 + wd * (255 - 16) / 255;
     inkPalW[d] = (uint16_t)(((b & 0xF8) << 8) | ((r & 0xFC) << 3) | (g >> 3));  // pre-rotated (see above)
-    int gr = 10 - d * 10 / 255;
-    int gg = 12 + d * (215 - 12) / 255;
-    int gb = 16 - d * 16 / 255;
+    int dg = (int)(255.0f * powf(d / 255.0f, 1.8f));   // v8.14: borders thinner
+    int gr = 10 - dg * 10 / 255;
+    int gg = 12 + dg * (215 - 12) / 255;
+    int gb = 16 - dg * 16 / 255;
     inkPalG[d] = (uint16_t)(((gb & 0xF8) << 8) | ((gr & 0xFC) << 3) | (gg >> 3));  // pre-rotated
   }
   inkPalInit = true;
@@ -1851,13 +1876,10 @@ static void drawBarF(bool force, bool push) {
   G->setTextColor(TFT_WHITE, TFT_NAVY);
   G->setCursor(130, 7);
   G->print(mid);
-  // buttons: [LIST] [-] [+]
+  // [LIST] label only (v8.10: the [-] [+] boxes are gone - zoom is
+  // the BtnC long-press toggle between x1 and x1.5)
   G->drawRect(228, 2, 38, 18, TFT_WHITE);
   G->setCursor(234, 7); G->print("LIST");
-  G->drawRect(269, 2, 23, 18, TFT_WHITE);
-  G->setCursor(277, 7); G->print("-");
-  G->drawRect(295, 2, 23, 18, TFT_WHITE);
-  G->setCursor(303, 7); G->print("+");
   if (push && sprOk) spr.pushSprite(0, 0);
 }
 static void drawBar() { drawBarF(true, true); }
@@ -3540,8 +3562,8 @@ static void handleButton(int btn, bool lng) {   // btn 0=A 1=B 2=C
     }
     return;
   }
-  // C long: zoom one step forward, wrapping to the widest view
-  zoomLevel = (zoomLevel >= maxZoomLevel()) ? 0 : zoomLevel + 1;
+  // C long: toggle zoom between x1 and x1.5 (v8.9)
+  zoomLevel = zoomLevel ? 0 : 1;
   clampCenter();
   mapDirty = true; fullRedraw = true; return;
 }
@@ -3574,7 +3596,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v8.8");
+  tft.print("APRS Map Viewer M5 v8.14");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -3632,7 +3654,7 @@ void setup() {
     const MapDef& mm = MAP_LIST[MODE_MAP[i]];
     modeCenterLat[i] = (mm.north + mm.south) / 2;
     modeCenterLon[i] = (mm.east + mm.west) / 2;
-    modeZoom[i] = (i == 0) ? 1 : 0;   // APRS opens at x1
+    modeZoom[i] = 0;   // v8.9: every mode opens at x1 / the fit view
   }
   centerLat = modeCenterLat[0];
   centerLon = modeCenterLon[0];
