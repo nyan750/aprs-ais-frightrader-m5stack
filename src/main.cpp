@@ -286,34 +286,47 @@ static void wifiPhase(bool forcePortal) {
   startConfigServer();
 }
 
-// Settings-reset gesture (M5 port): the Basic has no user BOOT button,
-// so after the splash appears, hold BtnB for 2 s (within the first
-// seconds) to wipe the saved settings and force the setup portal.
+// Boot gestures (M5 port): the Basic has no user BOOT button, so
+// after the splash appears: hold BtnB for 2 s to wipe the saved
+// settings and force the setup portal, or hold BtnC for 2 s to order
+// a map remake (v8.19 - sets the mgforce flag mapGenBoot consumes).
 static bool bootResetWindow() {
   pinMode(BTN_B_PIN, INPUT);   // M5: no BOOT button - BtnB is the gesture
+  pinMode(BTN_C_PIN, INPUT);
   tft.setFont(&fonts::Font0);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 40);
   tft.print("Hold BtnB 2s: reset settings");
+  tft.setCursor(10, 52);
+  tft.print("Hold BtnC 2s: remake map");
   uint32_t winStart = millis();
-  uint32_t lowStart = 0;
+  uint32_t lowB = 0, lowC = 0;
   while (true) {
-    if (digitalRead(BTN_B_PIN) == LOW) {
-      if (!lowStart) lowStart = millis();
-      if (millis() - lowStart >= 2000) {
-        Preferences p;
-        p.begin("aprsmap", false);
-        p.clear();
-        p.end();
-        tft.setCursor(10, 56);
-        tft.print("Settings cleared!");
-        delay(800);
-        return true;
-      }
-    } else {
-      lowStart = 0;
-      if (millis() - winStart > 2200) break;   // no press: boot on
+    bool bLow = digitalRead(BTN_B_PIN) == LOW;
+    bool cLow = digitalRead(BTN_C_PIN) == LOW;
+    if (bLow) { if (!lowB) lowB = millis(); } else lowB = 0;
+    if (cLow) { if (!lowC) lowC = millis(); } else lowC = 0;
+    if (lowB && millis() - lowB >= 2000) {
+      Preferences p;
+      p.begin("aprsmap", false);
+      p.clear();
+      p.end();
+      tft.setCursor(10, 68);
+      tft.print("Settings cleared!");
+      delay(800);
+      return true;
     }
+    if (lowC && millis() - lowC >= 2000) {
+      Preferences p;
+      p.begin("aprsmap", false);
+      p.putBool("mgforce", true);
+      p.end();
+      tft.setCursor(10, 68);
+      tft.print("Map remake set!");
+      delay(800);
+      return false;
+    }
+    if (!bLow && !cLow && millis() - winStart > 2200) break;   // no press: boot on
     if (millis() - winStart > 8000) break;
     delay(20);
   }
@@ -566,7 +579,7 @@ static uint32_t packetCount = 0;
 // ---------------- view ----------------
 static int    curMap = 0;
 static double centerLat = homeLat, centerLon = homeLon;
-static int    zoomLevel = 0;               // v8.12: 0 = x1 (whole map), 1 = x1.5 - toggled
+static int    zoomLevel = 0;               // v8.15: 0 = x1 (whole map), 1 = x1.5, 2 = x2
 static int    selected = -1;               // index into stations[]
 static bool   detailOpen = false;
 // Three screens (user request): APRS stations, Flight (aircraft) and
@@ -1073,9 +1086,9 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
     int bandOy0 = (int)(cyB0 * 480.0 / mgCropH);
     int oyB = (int)(cyB1 * 480.0 / mgCropH);
     int bandRowsFull = oyB - bandOy0 + 1;
-    for (int sb = 0; sb < bandRowsFull; sb += 40) {
+    for (int sb = 0; sb < bandRowsFull; sb += 32) {   // v8.21: back to the v8.7 width
       mgBandOy0 = bandOy0 + sb;
-      mgBandRows = bandRowsFull - sb; if (mgBandRows > 40) mgBandRows = 40;
+      mgBandRows = bandRowsFull - sb; if (mgBandRows > 32) mgBandRows = 32;
       // (v6.9: no RAM row accumulators - the merge writes flash)
       // v6: process the sub-band in 160-column strips. Phase A stages
       // the strip's raw tiles in flash; Phase B decodes them. The two
@@ -1256,24 +1269,15 @@ static bool __attribute__((noinline)) mgGenerate() {
     { +0.2599, -0.4401, -0.9401, +0.8566 },   // APRS:   N S W E
     { +1.0599, -0.4401, -0.7934, +0.9066 },   // FLIGHT: N S W E
   };
-  // v8.13: the extent follows the configured range - the 100 km
-  // layout above scaled by range/100 - and the tile zoom is chosen
-  // per map so the source size stays near the proven ~2600 / ~1300 px
-  // (reproduces z11 / z10 exactly at 100 km).
-  static const double SRC_TARGET[2] = { 2600, 1300 };
-  double sc = mgRangeKm() / 100.0;
+  // v8.18: back to the proven fixed layout (the v8.13 range-scaled
+  // geometry is removed together with the range condition below).
+  static const int ZS[2] = { 11, 10 };
   double b[2][4];
-  int ZS[2];
   for (int i = 0; i < 2; i++) {
-    b[i][0] = homeLat + OFF[i][0] * sc;
-    b[i][1] = homeLat + OFF[i][1] * sc;
-    b[i][2] = homeLon + OFF[i][2] * sc;
-    b[i][3] = homeLon + OFF[i][3] * sc;
-    double lonSpan = b[i][3] - b[i][2];
-    int z = (int)lround(log2(SRC_TARGET[i] * 360.0 / (256.0 * lonSpan)));
-    if (z < 9) z = 9;
-    if (z > 14) z = 14;
-    ZS[i] = z;
+    b[i][0] = homeLat + OFF[i][0];
+    b[i][1] = homeLat + OFF[i][1];
+    b[i][2] = homeLon + OFF[i][2];
+    b[i][3] = homeLon + OFF[i][3];
   }
   // v6: the PNG decoder is allocated HERE - the config server is
   // stopped and no TLS session exists yet, the emptiest heap of the
@@ -1312,11 +1316,20 @@ static bool __attribute__((noinline)) mgGenerate() {
   h.reserved[0] = (uint32_t)mgRangeKm();   // v8.13: range this map was made for
   mgShow("Done", "", 100);
   if (esp_partition_write(genPart, 0, &h, sizeof(h)) != ESP_OK) { mgFail = "header write"; return false; }
+  // v8.16: a backup header copy at the end of the header page, plus
+  // a read-back verify - a finished map was reported lost across a
+  // power cycle, its header reading back as erased (ffffffff/-1).
+  if (esp_partition_write(genPart, GEN_HDR_BYTES - sizeof(h), &h, sizeof(h)) != ESP_OK) { mgFail = "header write (backup)"; return false; }
+  { GenHeader v1 = {}, v2 = {};
+    bool okv = esp_partition_read(genPart, 0, &v1, sizeof(v1)) == ESP_OK && v1.magic == GEN_MAGIC
+            && esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(v2), &v2, sizeof(v2)) == ESP_OK && v2.magic == GEN_MAGIC;
+    if (!okv) { mgFail = "header verify"; return false; } }
   return true;
 }
 
 static char mgActFail[64] = "";   // v8.1: why the last activate failed
 static int mgHdrRangeKm = 100;    // v8.13: range stored in the map header
+static bool mgHdrFromBackup = false;   // v8.16: activation used the backup header
 // v8.13: one clamped view of the configured range, used for the map
 // geometry, the header stamp and the boot-time comparison alike.
 static int mgRangeKm() {
@@ -1332,20 +1345,41 @@ static bool mgActivate() {
                            (const void**)&genMapPtr, &genMmapH) != ESP_OK)
       { snprintf(mgActFail, sizeof(mgActFail), "mmap failed"); return false; }
   }
-  const GenHeader* h = (const GenHeader*)genMapPtr;
+  // v8.16: the header is read with esp_partition_read (not through
+  // the mmap), and a backup copy in the header page takes over if
+  // the primary is unreadable.
+  static GenHeader hdrS;
+  mgHdrFromBackup = false;
+  bool hdrOk = esp_partition_read(genPart, 0, &hdrS, sizeof(hdrS)) == ESP_OK
+               && hdrS.magic == GEN_MAGIC && hdrS.ver == 1;
+  if (!hdrOk) {
+    GenHeader bak;
+    if (esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(bak), &bak, sizeof(bak)) == ESP_OK
+        && bak.magic == GEN_MAGIC && bak.ver == 1) {
+      hdrS = bak;
+      mgHdrFromBackup = true;
+      hdrOk = true;
+      esp_partition_write(genPart, 0, &hdrS, sizeof(hdrS));   // self-heal (works when erased)
+      Serial.println("MAPGEN: primary header bad - using backup copy");
+    }
+  }
+  const GenHeader* h = &hdrS;
   if (h->magic != GEN_MAGIC || h->ver != 1) {
     snprintf(mgActFail, sizeof(mgActFail), "bad magic/ver %08x/%d",
              (unsigned)h->magic, (int)h->ver);
     Serial.printf("MAPGEN activate: %s\n", mgActFail);
+    { uint8_t d0[16], dB[16];
+      esp_partition_read(genPart, 0, d0, sizeof(d0));
+      esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(GenHeader), dB, sizeof(dB));
+      Serial.printf("MAPGEN hdr0 %02x %02x %02x %02x %02x %02x %02x %02x  hdrB %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    d0[0], d0[1], d0[2], d0[3], d0[4], d0[5], d0[6], d0[7],
+                    dB[0], dB[1], dB[2], dB[3], dB[4], dB[5], dB[6], dB[7]); }
     return false;
   }
-  if (fabs(h->homeLat - homeLat) > 0.01 || fabs(h->homeLon - homeLon) > 0.01) {
-    snprintf(mgActFail, sizeof(mgActFail),
-             "centre hdr %.4f,%.4f vs cur %.4f,%.4f",
-             h->homeLat, h->homeLon, homeLat, homeLon);
-    Serial.printf("MAPGEN activate: %s\n", mgActFail);
-    return false;
-  }
+  // v8.20: the header centre is NOT compared with the settings any
+  // more - changing the centre in the portal no longer triggers a
+  // remake. The stored map (with its own bounds from the header) is
+  // used as-is until a remake is ordered (BtnC boot hold / portal).
   for (int i = 0; i < 2; i++) {
     const uint8_t* base = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
     uint32_t s = 0;
@@ -1396,8 +1430,8 @@ static bool mgAllocWorkBuffers() {
   // heap alongside the live TLS session + pngle, in any arrangement.
   if (!mgSeaBits) mgSeaBits = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_DMA);
   if (!mgWork) mgWork = (uint8_t*)heap_caps_malloc(5760, MALLOC_CAP_DMA);
-  if (!mgAggGray) mgAggGray = (uint8_t*)heap_caps_malloc(160 * 40, MALLOC_CAP_DMA);
-  if (!mgAggSea) mgAggSea = (uint8_t*)heap_caps_malloc(160 * 40, MALLOC_CAP_DMA);
+  if (!mgAggGray) mgAggGray = (uint8_t*)heap_caps_malloc(160 * 32, MALLOC_CAP_DMA);
+  if (!mgAggSea) mgAggSea = (uint8_t*)heap_caps_malloc(160 * 32, MALLOC_CAP_DMA);
   return mgAggGray && mgAggSea && mgSeaBits && mgWork;
 }
 // v7.1: the work buffers live only inside Phase B of each strip.
@@ -1463,6 +1497,44 @@ static void mgDumpFailed() {
   Serial.flush();
 }
 
+static void mgDiagMaybeShow() {
+  GenHeader hp = {}, hb = {};
+  bool pOk = genPart && esp_partition_read(genPart, 0, &hp, sizeof(hp)) == ESP_OK
+             && hp.magic == GEN_MAGIC && hp.ver == 1;
+  bool bOk = genPart && esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(hb), &hb, sizeof(hb)) == ESP_OK
+             && hb.magic == GEN_MAGIC && hb.ver == 1;
+  char lgf[64] = "", laf[64] = "";
+  { Preferences p;
+    if (p.begin("aprsmap", true)) {
+      String s1 = p.getString("lgfail", ""), s2 = p.getString("lafail", "");
+      strncpy(lgf, s1.c_str(), sizeof(lgf) - 1);
+      strncpy(laf, s2.c_str(), sizeof(laf) - 1);
+      p.end();
+    } }
+  if (pOk && !lgf[0] && !laf[0]) return;   // healthy: no screen
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  int y = 10;
+  char b[80];
+  auto line = [&](const char* s) { tft.setCursor(8, y); tft.print(s); y += 15; };
+  line("MAP DIAG (v8.17)");
+  snprintf(b, sizeof(b), "SET c %.4f,%.4f r %d", homeLat, homeLon, cfgRangeKm); line(b);
+  if (pOk) { snprintf(b, sizeof(b), "HDR ok c %.4f,%.4f r %d", hp.homeLat, hp.homeLon,
+                      hp.reserved[0] ? (int)hp.reserved[0] : 100); line(b); }
+  else { snprintf(b, sizeof(b), "HDR BAD %08x/%d", (unsigned)hp.magic, (int)hp.ver); line(b); }
+  line(bOk ? "BAK ok" : "BAK bad");
+  line(WiFi.status() == WL_CONNECTED ? "WIFI ok" : "WIFI no");
+  if (lgf[0]) { snprintf(b, sizeof(b), "GENFAIL %s", lgf); line(b); }
+  if (laf[0]) { snprintf(b, sizeof(b), "ACTFAIL %s", laf); line(b); }
+  line("photo this screen, please");
+  delay(12000);
+  if (pOk) {   // shown once after recovery: clear the stale records
+    Preferences p;
+    if (p.begin("aprsmap", false)) { p.putString("lgfail", ""); p.putString("lafail", ""); p.end(); }
+  }
+}
+
 static void __attribute__((noinline)) mapGenBoot() {
   genPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
                                      ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "mapdata");
@@ -1480,6 +1552,7 @@ static void __attribute__((noinline)) mapGenBoot() {
     delay(9000);
     mgCkpt = 0;
   }
+  mgDiagMaybeShow();   // v8.17
   bool force = false;
   {
     Preferences p;
@@ -1490,15 +1563,13 @@ static void __attribute__((noinline)) mapGenBoot() {
     }
   }
   if (!force && mgActivate()) {
-    if (mgHdrRangeKm == mgRangeKm()) {
-      Serial.println("MAPGEN: generated maps active");
-      return;
-    }
-    // v8.13: the range changed since this map was generated - reject
-    // it (reason shown below) and fall through to regeneration.
-    snprintf(mgActFail, sizeof(mgActFail), "range hdr %d km vs cur %d km",
-             mgHdrRangeKm, mgRangeKm());
-    Serial.printf("MAPGEN activate: %s\n", mgActFail);
+    // v8.18: a stored map is accepted as-is. The v8.13 range
+    // condition (reject and regenerate when the header's range
+    // differs from the setting) is REMOVED - in the field it sent
+    // the device into an endless regeneration loop.
+    Serial.println("MAPGEN: generated maps active");
+    if (mgHdrFromBackup) { mgShow("Map header restored", "backup copy used", 0); delay(3000); }
+    return;
   }
   if (!force && mgActFail[0]) {   // v8.2: verdict on the LCD too
     mgShow("Stored map rejected", mgActFail, 0);
@@ -1520,7 +1591,14 @@ static void __attribute__((noinline)) mapGenBoot() {
   mgFreeGenBuffers();   // hand the heap back to normal operation
   cfgServer.begin();
   MDNS.begin("aprs-map");
-  if (genOk && mgActivate()) {
+  bool actOk = genOk && mgActivate();
+  { Preferences p;   // v8.17: persist the outcome for the diag screen
+    if (p.begin("aprsmap", false)) {
+      p.putString("lgfail", genOk ? "" : String(mgFail));
+      p.putString("lafail", (genOk && !actOk) ? String(mgActFail) : String(""));
+      p.end();
+    } }
+  if (actOk) {
     Serial.println("MAPGEN: generation complete");
     mgShow("Map generation complete", "", 100);
     delay(1200);
@@ -1558,8 +1636,10 @@ static void computeView() {
   int h = bi.ok ? bi.h : 240;
   double fit = min(320.0 / w, 240.0 / h);
   double s;
-  // v8.12: x1 = the whole map on screen, x1.5 = 1.5x that (toggle)
-  s = fit * (zoomLevel ? 1.5 : 1.0);
+  // v8.15: three stages - x1 = the whole map, then x1.5 and x2
+  static const double ZSCL[3] = { 1.0, 1.5, 2.0 };
+  int li = zoomLevel; if (li < 0) li = 0; if (li > 2) li = 2;
+  s = fit * ZSCL[li];
   vScale = s;
   vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
   vSrcH = 240.0 / s; if (vSrcH > h) vSrcH = h;
@@ -1596,7 +1676,7 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
 // map1 (all of Kagawa) is what you see first. Zoom in with [+] / station taps.
 static int maxZoomLevel() {
-  return 1;   // v8.9: two zoom states only (x1 / x1.5), toggled
+  return 2;   // v8.15: three stages (x1 / x1.5 / x2)
 }
 static int defaultZoomLevel() {
   return 0;   // every screen opens at x1 (APRS) / the fit view
@@ -1876,10 +1956,14 @@ static void drawBarF(bool force, bool push) {
   G->setTextColor(TFT_WHITE, TFT_NAVY);
   G->setCursor(130, 7);
   G->print(mid);
-  // [LIST] label only (v8.10: the [-] [+] boxes are gone - zoom is
-  // the BtnC long-press toggle between x1 and x1.5)
+  // buttons: [LIST] [-] [+] (the boxes are drawn again in v8.15;
+  // on this button-only unit they are display only - zoom is BtnC long)
   G->drawRect(228, 2, 38, 18, TFT_WHITE);
   G->setCursor(234, 7); G->print("LIST");
+  G->drawRect(269, 2, 23, 18, TFT_WHITE);
+  G->setCursor(277, 7); G->print("-");
+  G->drawRect(295, 2, 23, 18, TFT_WHITE);
+  G->setCursor(303, 7); G->print("+");
   if (push && sprOk) spr.pushSprite(0, 0);
 }
 static void drawBar() { drawBarF(true, true); }
@@ -3562,8 +3646,8 @@ static void handleButton(int btn, bool lng) {   // btn 0=A 1=B 2=C
     }
     return;
   }
-  // C long: toggle zoom between x1 and x1.5 (v8.9)
-  zoomLevel = zoomLevel ? 0 : 1;
+  // C long: zoom one step forward (x1 -> x1.5 -> x2), wrapping
+  zoomLevel = (zoomLevel >= maxZoomLevel()) ? 0 : zoomLevel + 1;
   clampCenter();
   mapDirty = true; fullRedraw = true; return;
 }
@@ -3596,7 +3680,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v8.14");
+  tft.print("APRS Map Viewer M5 v8.21");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
