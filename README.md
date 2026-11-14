@@ -87,7 +87,7 @@ M5 本体のフラッシュメモリの中の、「mapdata」という専用区�
 逆に 0x0 にフルイメージを書くと区画ごと初期化されます
 なお、生成が済んでいないとき用の予備地図は、ファームウェアに埋め込み（include/maps_data.h）です。
 
-<img src="portal.png">
+<img src="portal.png" width="480">
 
 設定画面（Webポータル）
 !設定画面
