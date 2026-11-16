@@ -1,6 +1,6 @@
 # APRSマップビューア（M5Stack Basic版）
 
-M5Stack Basic（ESP32 / ILI9342C 320×240、タッチなし）で動く、APRS・航空機・船舶のマップ表示機です。
+M5Stack Basic（ESP32 / ILI9342C 320×240、タッチなし）で動く、APRS・航空機・船舶のマップを表示します。画面が小さいのであまり詳細には表示できません。
 Wi-Fi 経由で APRS-IS / ADS-B / AIS のデータを受信し、地図上に表示します。操作は本体の3ボタン（BtnA / BtnB / BtnC）だけです。
 
 
