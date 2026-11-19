@@ -48,6 +48,9 @@ static String cfgAisKey;
 static int cfgPasscode = 0;
 static double homeLat = FILTER_LAT, homeLon = FILTER_LON;
 static int cfgRangeKm = FILTER_RANGE_KM;
+static uint8_t cfgScreens = 0;   // v8.22: shown screens bitmask (bit0 APRS, bit1 FLIGHT, bit2 AIS); 0 = all shown
+static bool screenVisible(int m) { return cfgScreens == 0 || (cfgScreens & (1 << m)); }
+static int firstVisibleMode() { for (int i = 0; i < 3; i++) if (screenVisible(i)) return i; return 0; }
 static WebServer cfgServer(80);
 static DNSServer dnsServer;
 static bool cfgServerStarted = false;
@@ -78,6 +81,7 @@ static void loadSettings(bool skipNvs) {
   homeLat = p.getDouble("lat", homeLat);
   homeLon = p.getDouble("lon", homeLon);
   cfgRangeKm = p.getInt("range", cfgRangeKm);
+  cfgScreens = p.getUChar("screens", 0);
   p.end();
 }
 
@@ -101,7 +105,7 @@ static void handleRoot() {
   String h = "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>APRS Map Setup</title><style>body{font-family:sans-serif;margin:16px}"
-    "label{display:block;margin-top:12px}input{width:100%;padding:8px;font-size:16px;box-sizing:border-box}"
+    "label{display:block;margin-top:12px}input{width:100%;padding:8px;font-size:16px;box-sizing:border-box}input[type=checkbox]{width:auto}"
     "button{margin-top:16px;width:100%;padding:12px;font-size:16px}</style></head><body>"
     "<h2>APRS Map 設定</h2><form method='POST' action='/save'>";
   h += "<label>Wi-Fi SSID<input name='ssid' value='" + htmlEsc(cfgSsid) + "'></label>";
@@ -112,6 +116,11 @@ static void handleRoot() {
   h += "<label>中心の経度<input name='lon' value='" + String(lonBuf) + "'></label>";
   h += "<label>受信範囲 km<input name='range' type='number' value='" + String(cfgRangeKm) + "'></label>";
   h += "<label>AIS APIキー (aisstream.io)<input name='aiskey' value='" + htmlEsc(cfgAisKey) + "'></label>";
+  h += "<div style='margin-top:12px'>表示する画面</div>";
+  h += String("<label style='margin-top:2px'><input type='checkbox' name='scrall'") + (cfgScreens == 0 ? " checked" : "") + "> 全部表示</label>";
+  h += String("<label style='margin-top:2px'><input type='checkbox' name='scr0'") + (screenVisible(0) ? " checked" : "") + "> APRS</label>";
+  h += String("<label style='margin-top:2px'><input type='checkbox' name='scr1'") + (screenVisible(1) ? " checked" : "") + "> FLIGHT</label>";
+  h += String("<label style='margin-top:2px'><input type='checkbox' name='scr2'") + (screenVisible(2) ? " checked" : "") + "> AIS</label>";
   h += "<button type='submit'>保存して再起動</button></form>"
        "<p>設定は本体に保存されます。config.h は初期値です。</p>"
        "<p><a href='/mapgen'>地図を作り直す</a>（中心の緯度経度に合わせて再生成します。数分かかります）</p></body></html>";
@@ -138,6 +147,12 @@ static void handleSave() {
     }
     int rg = cfgServer.arg("range").toInt();
     if (rg >= 10 && rg <= 500) p.putInt("range", rg);
+    int scrBits = 0;
+    if (cfgServer.hasArg("scr0")) scrBits |= 1;
+    if (cfgServer.hasArg("scr1")) scrBits |= 2;
+    if (cfgServer.hasArg("scr2")) scrBits |= 4;
+    if (cfgServer.hasArg("scrall") || scrBits == 0) scrBits = 0;   // 0 = all shown
+    p.putUChar("screens", (uint8_t)scrBits);
     p.end();
   }
   cfgServer.send(200, "text/html",
@@ -579,7 +594,7 @@ static uint32_t packetCount = 0;
 // ---------------- view ----------------
 static int    curMap = 0;
 static double centerLat = homeLat, centerLon = homeLon;
-static int    zoomLevel = 0;               // v8.15: 0 = x1 (whole map), 1 = x1.5, 2 = x2
+static int    zoomLevel = 0;               // 0 = x1 (whole map), 1 = x1.5, 2 = x2, 3 = x2.5 (v8.22)
 static int    selected = -1;               // index into stations[]
 static bool   detailOpen = false;
 // Three screens (user request): APRS stations, Flight (aircraft) and
@@ -615,8 +630,8 @@ static bool   geoToPx(double lat, double lon, int& px, int& py);
 #undef MAPS
 #define MAP_COUNT 2
 static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when generated maps are active (v5)
-  { "/map1.bmp", "KAGAWA",  34.60, 33.90, 133.40, 134.90 },  // APRS screen: Kagawa only (z11 source)
-  { "/map2.bmp", "OKAYAMA", 35.40, 33.90, 133.25, 134.95 },  // Flight screen: Okayama + Kagawa
+  { "/map1.bmp", "MAP1",  36.10, 35.40, 139.00, 140.50 },  // APRS screen: detailed map (z11 source)
+  { "/map2.bmp", "MAP2", 36.40, 34.90, 138.90, 140.60 },  // Flight screen: wide map (z10 source)
 };
 
 // ---------------- on-device map generation (m5 v5 prototype) --------
@@ -627,7 +642,7 @@ static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when g
 // standard tiles' sea mask, downscales to the usual 640x480 4-bit
 // gray + class-bit format, and stores the result in the dedicated
 // "mapdata" flash partition. The renderer then reads the generated
-// maps through a flash mmap instead of the baked-in Takamatsu maps,
+// maps through a flash mmap instead of the baked-in maps,
 // which remain the fallback. Map bounds mirror make_maps.py's layout
 // relative to the centre. PNG decoding: pngle (c) kikuchan, MIT.
 // Prototype simplifications vs the PC pipeline: no place-name text
@@ -636,11 +651,13 @@ static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when g
 #define GEN_MAGIC 0x4D473501u            // 'MG5' v1
 #define GEN_HDR_BYTES 0x1000
 #define GEN_MAP_BYTES (153600 + 38400)   // gray + class per map
+#define GEN_COL_MAP_BYTES 614400   // v8.23: colour map per map (640x480 RGB565)
 #define GEN_SCR_OFF  0x100000            // pass-1 aggregate scratch
 #define GEN_SCR_GRAY GEN_SCR_OFF
 #define GEN_SCR_SEA  (GEN_SCR_OFF + 307200)
 #define GEN_TOTAL_END (GEN_SCR_SEA + 307200)
 #define GEN_STAGE_OFF GEN_TOTAL_END   // v6: raw-tile stage up to partition end
+#define GEN_COL_STAGE_OFF (GEN_HDR_BYTES + GEN_COL_MAP_BYTES)   // v8.30: colour stage base
 
 struct GenHeader {
   uint32_t magic, ver;
@@ -654,6 +671,8 @@ static const esp_partition_t* genPart = nullptr;
 static const uint8_t* genMapPtr = nullptr;   // mmap base of genPart
 static spi_flash_mmap_handle_t genMmapH = 0;
 static bool genMapsActive = false;
+static const uint8_t* mapColorPtr[2] = { nullptr, nullptr };   // v8.23
+static bool genColorActive = false;   // v8.23: stored maps are colour (header ver 2)
 static const uint8_t* mapGrayPtr[2]  = { MAP_GRAY[0],  MAP_GRAY[1] };
 static const uint8_t* mapClassPtr[2] = { MAP_CLASS[0], MAP_CLASS[1] };
 
@@ -707,6 +726,10 @@ static int mgBandOy0 = 0, mgBandRows = 0;
 static int mgStripX0 = 0;   // v6: output column where the current strip starts
 static uint8_t* mgAggGray = nullptr;       // [bandRows][640] min luminance
 static uint8_t* mgAggSea = nullptr;        // [bandRows][640] sea pixel count
+static uint16_t* mgAggR = nullptr;         // v8.23: colour sums [bandRows][160]
+static uint16_t* mgAggG = nullptr;
+static uint16_t* mgAggB = nullptr;
+static uint8_t*  mgAggCnt = nullptr;
 static uint32_t mgWdtCtr = 0;
 static long mgPixels = 0;          // v6.3: pixels drawn by the current decode
 static char mgFailDetail[80] = ""; // v6.3: extra line for the FAILED screen
@@ -732,6 +755,24 @@ static void mgAccum(int gx, int gy, int r, int g, int b, int lx, int ly) {
   }
 }
 
+// v8.23: colour accumulate (pale tiles) - the same crop->output
+// scatter as mgAccum, but sums the true RGB per output pixel.
+static void mgAccumColour(int gx, int gy, int r, int g, int b) {
+  int cx = gx - mgCropX0, cy = gy - mgCropY0;
+  if (cx < 0 || cy < 0 || cx >= mgCropW || cy >= mgCropH) return;
+  int oy = (int)((double)cy * 480.0 / mgCropH);
+  int ox = (int)((double)cx * 640.0 / mgCropW);
+  int lo = oy - mgBandOy0;
+  if (lo < 0 || lo >= mgBandRows) return;
+  int sx = ox - mgStripX0;
+  if (sx < 0 || sx >= 160) return;
+  int ai = lo * 160 + sx;
+  mgAggR[ai] = (uint16_t)(mgAggR[ai] + r);
+  mgAggG[ai] = (uint16_t)(mgAggG[ai] + g);
+  mgAggB[ai] = (uint16_t)(mgAggB[ai] + b);
+  if (mgAggCnt[ai] < 255) mgAggCnt[ai]++;
+}
+
 static void mgDrawCb(pngle_t* png, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                      const uint8_t rgba[4]) {
   (void)png;
@@ -746,6 +787,8 @@ static void mgDrawCb(pngle_t* png, uint32_t x, uint32_t y, uint32_t w, uint32_t 
           mgSeaBits[ly * 32 + (lx >> 3)] |= (uint8_t)(0x80 >> (lx & 7));
       } else if (mgMode == 1) {
         mgAccum(mgTileOx + lx, mgTileOy + ly, rgba[0], rgba[1], rgba[2], lx, ly);
+      } else if (mgMode == 3) {   // v8.23: pale tile, colour accumulate
+        mgAccumColour(mgTileOx + lx, mgTileOy + ly, rgba[0], rgba[1], rgba[2]);
       }   // mode 2 = warm-up fetch: decode but discard every pixel
     }
   if ((++mgWdtCtr & 0x3FF) == 0) esp_task_wdt_reset();
@@ -824,6 +867,7 @@ static uint8_t mgTmpBuf[2048];   // v6.1: stage/decode/merge scratch.
 // These phases never nest, so one static buffer serves all three -
 // as stack arrays they overflowed the 8 KB loopTask stack (on-device
 // panic: "stack overflow in task loopTask", first decode of v6).
+static uint32_t mgStageOff = GEN_STAGE_OFF;   // v8.30: stage base (mgGenerate moves it for colour)
 static uint32_t mgStageUsed = 0;          // padded bytes in the stage
 static uint32_t mgStagePrevUsed = 0;      // v6.6: bytes to re-erase pre-strip
 static uint8_t mgStageCarry[4];
@@ -839,7 +883,7 @@ static bool mgStageWriteRaw(const uint8_t* data, int n) {
     memcpy(mgStageCarry + mgStageCarryN, data, k);
     mgStageCarryN += k; data += k; n -= k;
     if (mgStageCarryN == 4) {
-      if (esp_partition_write(genPart, GEN_STAGE_OFF + mgStageUsed,
+      if (esp_partition_write(genPart, mgStageOff + mgStageUsed,
                               mgStageCarry, 4) != ESP_OK)
         return false;
       mgStageUsed += 4;
@@ -851,7 +895,7 @@ static bool mgStageWriteRaw(const uint8_t* data, int n) {
 static bool mgStageEndRecord() {   // flush the tail, 0-padded to 4
   if (mgStageCarryN == 0) return true;
   while (mgStageCarryN < 4) mgStageCarry[mgStageCarryN++] = 0;
-  if (esp_partition_write(genPart, GEN_STAGE_OFF + mgStageUsed,
+  if (esp_partition_write(genPart, mgStageOff + mgStageUsed,
                           mgStageCarry, 4) != ESP_OK)
     return false;
   mgStageUsed += 4;
@@ -936,7 +980,7 @@ static bool mgDecodeStaged(int rec, int ty, int mode) {
   mgPixels = 0;
   // v6.2: feed the tile in ONE pngle_feed call, straight from the
   // flash mmap (chunked feeding trips a pngle boundary bug).
-  int r = pngle_feed(mgPng, genMapPtr + GEN_STAGE_OFF + mgRecOff[rec],
+  int r = pngle_feed(mgPng, genMapPtr + mgStageOff + mgRecOff[rec],
                      mgRecLen[rec]);
   esp_task_wdt_reset();
   if (r >= 0) return true;
@@ -945,8 +989,8 @@ static bool mgDecodeStaged(int rec, int ty, int mode) {
   // chunks - the retry verdict separates "bad staged bytes / ROM
   // inflate" (retry fails too) from "mmap feed path" (retry works).
   uint8_t mm4[4] = {0}, pr4[4] = {0};
-  memcpy(mm4, genMapPtr + GEN_STAGE_OFF + mgRecOff[rec], 4);
-  esp_partition_read(genPart, GEN_STAGE_OFF + mgRecOff[rec], pr4, 4);
+  memcpy(mm4, genMapPtr + mgStageOff + mgRecOff[rec], 4);
+  esp_partition_read(genPart, mgStageOff + mgRecOff[rec], pr4, 4);
   long px1 = mgPixels;
   pngle_reset(mgPng);
   mgPixels = 0;
@@ -956,7 +1000,7 @@ static bool mgDecodeStaged(int rec, int ty, int mode) {
     uint8_t* rbuf = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_DMA);
     uint32_t ch = rbuf ? 8192 : 2048;
     if (!rbuf) rbuf = mgTmpBuf;
-    uint32_t off = GEN_STAGE_OFF + mgRecOff[rec];
+    uint32_t off = mgStageOff + mgRecOff[rec];
     uint32_t left = mgRecLen[rec];
     while (left > 0) {
       uint32_t n = left > ch ? ch : left;
@@ -1037,7 +1081,7 @@ static bool mgCoastAt(int r, int x) {
 static bool mgStripRecordsValid() {
   if (!genMapPtr) return false;
   for (int rec = 0; rec < mgRecCount; rec++) {
-    const uint8_t* p = genMapPtr + GEN_STAGE_OFF + mgRecOff[rec];
+    const uint8_t* p = genMapPtr + mgStageOff + mgRecOff[rec];
     uint32_t len = mgRecLen[rec];
     if (len < 8 || memcmp(p, "\x89PNG\r\n\x1a\n", 8) != 0) return false;
     uint32_t off = 8;
@@ -1122,7 +1166,7 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
             uint32_t eb = (mgStagePrevUsed + 4095) & ~4095u;
             for (uint32_t o = 0; o < eb; o += 65536) {
               uint32_t n = eb - o > 65536 ? 65536 : eb - o;
-              esp_partition_erase_range(genPart, GEN_STAGE_OFF + o, n);
+              esp_partition_erase_range(genPart, mgStageOff + o, n);
               esp_task_wdt_reset();
             }
             mgStagePrevUsed = 0;
@@ -1130,7 +1174,7 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
           mgStageUsed = 0; mgStageCarryN = 0; mgRecCount = 0;
           ok = true;
           for (int tx = txA; tx <= txB && ok; tx++) {
-            if (mgStageUsed > (genPart->size - GEN_STAGE_OFF) - 131072) {
+            if (mgStageUsed > (genPart->size - mgStageOff) - 131072) {
               mgFail = "stage full"; return false;
             }
             ok = mgStageTile(z, tx, ty, "std") && mgStageTile(z, tx, ty, "blank");
@@ -1145,7 +1189,7 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
               uint32_t eb = (mgStageUsed + 4095) & ~4095u;
               for (uint32_t o = 0; o < eb; o += 65536) {
                 uint32_t n = eb - o > 65536 ? 65536 : eb - o;
-                esp_partition_erase_range(genPart, GEN_STAGE_OFF + o, n);
+                esp_partition_erase_range(genPart, mgStageOff + o, n);
                 esp_task_wdt_reset();
               }
             }
@@ -1261,24 +1305,225 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
   return true;
 }
 
+
+// v8.23: colour aggregate buffers - the same alloc/free-per-strip
+// discipline as the mono work set (Phase A gets a clean heap).
+static bool mgAllocColourBuffers() {
+  if (!mgAggR) mgAggR = (uint16_t*)heap_caps_malloc(160 * 32 * sizeof(uint16_t), MALLOC_CAP_DMA);
+  if (!mgAggG) mgAggG = (uint16_t*)heap_caps_malloc(160 * 32 * sizeof(uint16_t), MALLOC_CAP_DMA);
+  if (!mgAggB) mgAggB = (uint16_t*)heap_caps_malloc(160 * 32 * sizeof(uint16_t), MALLOC_CAP_DMA);
+  if (!mgAggCnt) mgAggCnt = (uint8_t*)heap_caps_malloc(160 * 32, MALLOC_CAP_DMA);
+  return mgAggR && mgAggG && mgAggB && mgAggCnt;
+}
+static void mgFreeColourBuffers() {
+  if (mgAggR) { free(mgAggR); mgAggR = nullptr; }
+  if (mgAggG) { free(mgAggG); mgAggG = nullptr; }
+  if (mgAggB) { free(mgAggB); mgAggB = nullptr; }
+  if (mgAggCnt) { free(mgAggCnt); mgAggCnt = nullptr; }
+}
+
+// v8.23: colour variant of mgOneMap - same crop/band/strip/staging
+// skeleton (the v8.7-proven shape), but fetches GSI pale tiles only
+// and stores a 640x480 RGB565 image per map.
+static bool __attribute__((noinline)) mgOneMapColour(int mi, const double b[4], int z, uint32_t dataOff, uint32_t* sumOut) {
+  mgStripNo = 0;   // v8.6
+  double x0 = mgGx(b[2], z), x1 = mgGx(b[3], z);
+  double y0 = mgGy(b[0], z), y1 = mgGy(b[1], z);
+  mgCropW = (int)lround(x1 - x0);
+  mgCropH = (int)lround(y1 - y0);
+  mgCropX0 = (int)floor(x0);
+  mgCropY0 = (int)floor(y0);
+  if (mgCropW < 64 || mgCropH < 64) { mgFail = "crop size"; return false; }
+  int tx0 = mgCropX0 >> 8, tx1 = (mgCropX0 + mgCropW - 1) >> 8;
+  int ty0 = mgCropY0 >> 8, ty1 = (mgCropY0 + mgCropH - 1) >> 8;
+  // (the work buffers, pointer carve and weight tables are set up by
+  // mgPrepWorkBuffers() at the first decode phase - v6)
+  // v8.24: the loop is BAND-major (output rows 0..479 in 32-row
+  // bands), not tile-row-major as in the mono pipeline. The mono
+  // bands overlapped by one output row at most tile-row boundaries;
+  // harmless there (pass 2 re-emitted from scratch), but the colour
+  // emit writes the final image directly, so an overlapped row was
+  // written twice and its bytes counted twice in the header sum -
+  // activation then rejected the finished maps and the next boot
+  // generated them again (the v8.23 remake loop). Here each band
+  // fetches every tile row it intersects (1-2), each output row is
+  // emitted exactly once with all its source pixels averaged, and
+  // the header sum is read back from the finished image below.
+  char l2[48];
+  for (int bandStart = 0; bandStart < 480; bandStart += 32) {
+      mgBandOy0 = bandStart;
+      mgBandRows = 480 - bandStart; if (mgBandRows > 32) mgBandRows = 32;
+      int cyA = (int)(mgBandOy0 * (double)mgCropH / 480.0);
+      int cyB = (int)((mgBandOy0 + mgBandRows) * (double)mgCropH / 480.0);
+      if (cyB <= cyA) cyB = cyA + 1;
+      if (cyB > mgCropH) cyB = mgCropH;
+      int tyA = (mgCropY0 + cyA) >> 8; if (tyA < ty0) tyA = ty0;
+      int tyB = (mgCropY0 + cyB - 1) >> 8; if (tyB > ty1) tyB = ty1;
+      // v6: process the band in 160-column strips. Phase A stages
+      // the strip's raw tiles in flash; Phase B decodes them. The
+      // two phases never hold their big allocations at the same time.
+      for (int sx0 = 0; sx0 < 640; sx0 += 160) {
+        mgStripX0 = sx0;
+        mgStripNo++; mgCkpt = ((uint32_t)(mi + 1) << 24) | ((uint32_t)(mgStripNo & 0xFFFF) << 8) | 1;   // v8.6
+        int inX0 = mgCropX0 + (int)(sx0 * (double)mgCropW / 640);
+        int inX1 = mgCropX0 + (int)((sx0 + 160) * (double)mgCropW / 640);
+        int txA = inX0 >> 8; if (txA < tx0) txA = tx0;
+        int txB = (inX1 - 1) >> 8; if (txB > tx1) txB = tx1;
+        // ---- Phase A: fetch this strip's tiles into the stage ----
+        // v8.3: up to 3 attempts per strip. v8.2 died at 99% on one
+        // late transient fetch failure (http -1, tiles 308); a strip
+        // now restages after a pause instead of aborting the run.
+        bool ok = false;
+        mgFailDetail[0] = 0;   // v8.5: detail belongs to this strip
+        for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+          if (attempt > 1) {
+            mgHttp.end(); mgTls.stop();
+            mgShow("Fetch failed - retrying", "",
+                   (mgBandOy0 + mgBandRows) * 95 / 480);
+            delay(4000 * attempt);
+            esp_task_wdt_reset();
+            mgStagePrevUsed = mgStageUsed;   // erase partial stage
+          }
+          // v6.6: erase what the previous strip/attempt left in the
+          // stage - programming over programmed cells ANDs old and
+          // new bytes (the deterministic "tile decode" corruption).
+          if (mgStagePrevUsed) {
+            uint32_t eb = (mgStagePrevUsed + 4095) & ~4095u;
+            for (uint32_t o = 0; o < eb; o += 65536) {
+              uint32_t n = eb - o > 65536 ? 65536 : eb - o;
+              esp_partition_erase_range(genPart, mgStageOff + o, n);
+              esp_task_wdt_reset();
+            }
+            mgStagePrevUsed = 0;
+          }
+          mgStageUsed = 0; mgStageCarryN = 0; mgRecCount = 0;
+          ok = true;
+          for (int ty = tyA; ty <= tyB && ok; ty++)
+            for (int tx = txA; tx <= txB && ok; tx++) {
+              if (mgStageUsed > (genPart->size - mgStageOff) - 131072) {
+                mgFail = "stage full"; return false;
+              }
+              int rcBefore = mgRecCount;
+              ok = mgStageTile(z, tx, ty, "pale");
+              if (ok && mgRecCount > rcBefore) mgRecTy[mgRecCount - 1] = ty;   // v8.24
+            }
+          // v6.5: if a staged record's chunk structure is broken,
+          // hard-reset the connection and refetch the strip once.
+          if (ok && !mgStripRecordsValid()) {
+            mgHttp.end();
+            mgTls.stop();
+            delay(300);
+            {   // v6.6: erase the invalid records before restaging
+              uint32_t eb = (mgStageUsed + 4095) & ~4095u;
+              for (uint32_t o = 0; o < eb; o += 65536) {
+                uint32_t n = eb - o > 65536 ? 65536 : eb - o;
+                esp_partition_erase_range(genPart, mgStageOff + o, n);
+                esp_task_wdt_reset();
+              }
+            }
+            mgStageUsed = 0; mgStageCarryN = 0; mgRecCount = 0;
+            for (int ty = tyA; ty <= tyB && ok; ty++)
+              for (int tx = txA; tx <= txB && ok; tx++) {
+                int rcBefore = mgRecCount;
+                ok = mgStageTile(z, tx, ty, "pale");
+                if (ok && mgRecCount > rcBefore) mgRecTy[mgRecCount - 1] = ty;   // v8.24
+              }
+            if (ok && !mgStripRecordsValid()) {   // v8.3: failed attempt
+              ok = false;
+              if (!mgFailDetail[0])
+                snprintf(mgFailDetail, sizeof(mgFailDetail),
+                         "z%d ty%d sx%d bad record heap %u", z, tyA, sx0,
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+            }
+          }
+        }
+        snprintf(l2, sizeof(l2), "rows %d/480 heap %u", mgBandOy0 + mgBandRows,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        mgShow("Map (wide area)", l2, (mgBandOy0 + mgBandRows) * 95 / 480);
+        if (!ok) { mgFail = "tile fetch"; return false; }
+        mgCkpt = ((uint32_t)(mi + 1) << 24) | ((uint32_t)(mgStripNo & 0xFFFF) << 8) | 2;   // v8.6
+        // ---- Phase B: decode the staged tiles into the aggregates ----
+        // v8.7: try the work set with the TLS session still up;
+        // only if it does not fit, drop the session and retry
+        // the allocation once (kept as a fallback).
+        if (!mgAllocColourBuffers()) {
+          mgHttp.end(); mgTls.stop();
+          if (!mgAllocColourBuffers()) return false;
+        }
+        memset(mgAggR, 0, 160 * mgBandRows * sizeof(uint16_t));
+        memset(mgAggG, 0, 160 * mgBandRows * sizeof(uint16_t));
+        memset(mgAggB, 0, 160 * mgBandRows * sizeof(uint16_t));
+        memset(mgAggCnt, 0, 160 * mgBandRows);
+        for (int rec = 0; rec < mgRecCount; rec++) {
+          if (!mgDecodeStaged(rec, mgRecTy[rec], 3)) {
+            mgFail = "tile decode"; mgDumpRec = rec; return false;
+          }
+        }
+        // v8.23: emit this strip-band straight into the final colour
+        // image (average the accumulated RGB per output pixel).
+        for (int lo = 0; lo < mgBandRows; lo++) {
+          int oy = mgBandOy0 + lo;
+          uint16_t* rowC = (uint16_t*)mgTmpBuf;   // 160 px = 320 B
+          for (int sx = 0; sx < 160; sx++) {
+            int ai = lo * 160 + sx;
+            int cnt = mgAggCnt[ai];
+            uint16_t px;
+            if (cnt) {
+              int r = mgAggR[ai] / cnt, g = mgAggG[ai] / cnt, b = mgAggB[ai] / cnt;
+              px = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            } else {
+              px = (uint16_t)(((190 >> 3) << 11) | ((210 >> 2) << 5) | (255 >> 3));   // GSI pale sea
+            }
+            rowC[sx] = px;
+          }
+          esp_partition_write(genPart, dataOff + ((uint32_t)oy * 640 + mgStripX0) * 2, rowC, 320);
+        }
+        mgStagePrevUsed = mgStageUsed;   // v6.6: re-erase next strip
+        mgFreeColourBuffers();
+        esp_task_wdt_reset();
+      }
+  }
+
+  // v8.24: the header sum is read back from the finished image, so
+  // it always matches what activation will compute over the flash.
+  if (!genMapPtr) { mgFail = "stage mmap"; return false; }
+  const uint8_t* base = genMapPtr + dataOff;
+  uint32_t s = 0;
+  for (uint32_t k = 0; k < GEN_COL_MAP_BYTES; k++) s += base[k];
+  *sumOut = s;
+  return true;
+}
+
 static bool __attribute__((noinline)) mgGenerate() {
   mgStagePrevUsed = 0;   // v6.6: full erase below covers the first strip
-  // Bounds relative to home, mirroring the Takamatsu layout of
-  // make_maps.py (map1 z11 narrow, map2 z10 wide).
-  static const double OFF[2][4] = {
-    { +0.2599, -0.4401, -0.9401, +0.8566 },   // APRS:   N S W E
-    { +1.0599, -0.4401, -0.7934, +0.9066 },   // FLIGHT: N S W E
-  };
-  // v8.18: back to the proven fixed layout (the v8.13 range-scaled
-  // geometry is removed together with the range condition below).
-  static const int ZS[2] = { 11, 10 };
+  // v8.28: ONE map matched to the setup receive range, shared by all
+  // screens (the 028 v103 geometry, user request). The frame is the
+  // range circle's bounding square around home: half-extents in
+  // degrees from the range in km. Halving the range therefore halves
+  // the covered area and doubles the on-screen scale. (The v8.18
+  // fixed layout ignored the range entirely - that is the bug the
+  // user reported: "range halved, map size unchanged".)
+  // NOTE: the boot-time range comparison stays REMOVED (v8.18 - it
+  // caused an endless regeneration loop in the field). A remake is
+  // still ordered manually (BtnC boot hold / portal link); the new
+  // range is picked up by that remake.
+  double R = mgRangeKm();
+  double halfLat = R / 111.0;
+  double clat = cos(homeLat * M_PI / 180.0); if (clat < 0.2) clat = 0.2;
+  double halfLon = R / (111.0 * clat);
   double b[2][4];
   for (int i = 0; i < 2; i++) {
-    b[i][0] = homeLat + OFF[i][0];
-    b[i][1] = homeLat + OFF[i][1];
-    b[i][2] = homeLon + OFF[i][2];
-    b[i][3] = homeLon + OFF[i][3];
+    b[i][0] = homeLat + halfLat;
+    b[i][1] = homeLat - halfLat;
+    b[i][2] = homeLon - halfLon;
+    b[i][3] = homeLon + halfLon;
   }
+  // Tile zoom: smallest z whose source width reaches ~1500 px
+  // (about 2.3x downscale to 640), clamped to [9, 12] - the 028
+  // rule. At 100 km this gives z10 (same as the old fixed layout),
+  // at 50 km z11, at 200 km z9.
+  int zGen = 9;
+  while (zGen < 12 && (b[0][3] - b[0][2]) * 256.0 * (1 << zGen) / 360.0 < 1500.0) zGen++;
   // v6: the PNG decoder is allocated HERE - the config server is
   // stopped and no TLS session exists yet, the emptiest heap of the
   // boot (the standalone diagnostic reached GSI with ~110 KB free in
@@ -1301,13 +1546,21 @@ static bool __attribute__((noinline)) mgGenerate() {
       mgFail = "stage mmap"; return false;
     }
   }
+  // v8.30: the colour stage starts right after the stored image and
+  // runs to the partition end (~1.6 MB). The old stage above the
+  // mono scratch left only ~303 KB usable, and at z12 (small ranges)
+  // the pale tiles run 50-80 KB each around the user's centre - one
+  // strip needed ~390 KB and generation died with GENFAIL
+  // "stage full" (measured on the real tiles, 2026-11-19). The mono
+  // scratch between the image and the old stage is unused by the
+  // colour pipeline, so this overlap is safe.
+  mgStageOff = GEN_COL_STAGE_OFF;
   uint32_t sums[2] = { 0, 0 };
-  for (int i = 0; i < 2; i++)
-    if (!mgOneMap(i, b[i], ZS[i], GEN_HDR_BYTES + i * GEN_MAP_BYTES, &sums[i]))
-      return false;
+  if (!mgOneMapColour(0, b[0], zGen, GEN_HDR_BYTES, &sums[0]))
+    return false;
   GenHeader h = {};
   h.magic = GEN_MAGIC;
-  h.ver = 1;
+  h.ver = 2;   // v8.23: colour maps
   h.homeLat = homeLat;
   h.homeLon = homeLon;
   memcpy(h.b, b, sizeof(b));
@@ -1351,11 +1604,11 @@ static bool mgActivate() {
   static GenHeader hdrS;
   mgHdrFromBackup = false;
   bool hdrOk = esp_partition_read(genPart, 0, &hdrS, sizeof(hdrS)) == ESP_OK
-               && hdrS.magic == GEN_MAGIC && hdrS.ver == 1;
+               && hdrS.magic == GEN_MAGIC && (hdrS.ver == 1 || hdrS.ver == 2);
   if (!hdrOk) {
     GenHeader bak;
     if (esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(bak), &bak, sizeof(bak)) == ESP_OK
-        && bak.magic == GEN_MAGIC && bak.ver == 1) {
+        && bak.magic == GEN_MAGIC && (bak.ver == 1 || bak.ver == 2)) {
       hdrS = bak;
       mgHdrFromBackup = true;
       hdrOk = true;
@@ -1364,7 +1617,7 @@ static bool mgActivate() {
     }
   }
   const GenHeader* h = &hdrS;
-  if (h->magic != GEN_MAGIC || h->ver != 1) {
+  if (h->magic != GEN_MAGIC || (h->ver != 1 && h->ver != 2)) {
     snprintf(mgActFail, sizeof(mgActFail), "bad magic/ver %08x/%d",
              (unsigned)h->magic, (int)h->ver);
     Serial.printf("MAPGEN activate: %s\n", mgActFail);
@@ -1380,10 +1633,12 @@ static bool mgActivate() {
   // more - changing the centre in the portal no longer triggers a
   // remake. The stored map (with its own bounds from the header) is
   // used as-is until a remake is ordered (BtnC boot hold / portal).
-  for (int i = 0; i < 2; i++) {
-    const uint8_t* base = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
+  const uint32_t mapBytes = (h->ver == 2) ? GEN_COL_MAP_BYTES : GEN_MAP_BYTES;
+  const int nChk = (h->ver == 2) ? 1 : 2;   // v8.25: colour = one map
+  for (int i = 0; i < nChk; i++) {
+    const uint8_t* base = genMapPtr + GEN_HDR_BYTES + i * mapBytes;
     uint32_t s = 0;
-    for (int k = 0; k < GEN_MAP_BYTES; k++) s += base[k];
+    for (uint32_t k = 0; k < mapBytes; k++) s += base[k];
     if (s != h->sum[i]) {
       snprintf(mgActFail, sizeof(mgActFail),
                "map %d sum flash %u vs hdr %u", i, (unsigned)s, (unsigned)h->sum[i]);
@@ -1394,14 +1649,22 @@ static bool mgActivate() {
   mgActFail[0] = 0;
   mgHdrRangeKm = h->reserved[0] ? (int)h->reserved[0] : 100;   // v8.13
   for (int i = 0; i < 2; i++) {
-    mapGrayPtr[i] = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
-    mapClassPtr[i] = mapGrayPtr[i] + 153600;
-    MAP_LIST[i].north = h->b[i][0];
-    MAP_LIST[i].south = h->b[i][1];
-    MAP_LIST[i].west = h->b[i][2];
-    MAP_LIST[i].east = h->b[i][3];
+    if (h->ver == 2) {
+      mapColorPtr[i] = genMapPtr + GEN_HDR_BYTES;   // v8.25: both slots alias the one map
+    } else {
+      mapGrayPtr[i] = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
+      mapClassPtr[i] = mapGrayPtr[i] + 153600;
+    }
+    const double* bb = h->b[h->ver == 2 ? 0 : i];   // v8.25
+    MAP_LIST[i].north = bb[0];
+    MAP_LIST[i].south = bb[1];
+    MAP_LIST[i].west = bb[2];
+    MAP_LIST[i].east = bb[3];
   }
+  genColorActive = (h->ver == 2);
   genMapsActive = true;
+  Serial.println(genColorActive ? "MAPGEN: colour maps active (GSI pale)"
+                                : "MAPGEN: mono maps active");
   return true;
 }
 
@@ -1447,6 +1710,7 @@ static void mgFreeWorkBuffers() {
 }
 
 static void mgFreeGenBuffers() {
+  mgFreeColourBuffers();
   if (mgPng) { free(mgPng); mgPng = nullptr; }
   if (mgAggGray) { free(mgAggGray); mgAggGray = nullptr; }
   if (mgAggSea) { free(mgAggSea); mgAggSea = nullptr; }
@@ -1459,7 +1723,7 @@ extern "C" unsigned long mz_crc32(unsigned long crc,
 static void mgDumpFailed() {
   if (mgDumpRec < 0 || !genPart) return;
   int rec = mgDumpRec;
-  uint32_t off = GEN_STAGE_OFF + mgRecOff[rec], len = mgRecLen[rec];
+  uint32_t off = mgStageOff + mgRecOff[rec], len = mgRecLen[rec];
   uint32_t crc = 0;
   {
     uint32_t o = off, left = len;
@@ -1500,9 +1764,9 @@ static void mgDumpFailed() {
 static void mgDiagMaybeShow() {
   GenHeader hp = {}, hb = {};
   bool pOk = genPart && esp_partition_read(genPart, 0, &hp, sizeof(hp)) == ESP_OK
-             && hp.magic == GEN_MAGIC && hp.ver == 1;
+             && hp.magic == GEN_MAGIC && (hp.ver == 1 || hp.ver == 2);   // v8.29: colour maps are ver 2
   bool bOk = genPart && esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(hb), &hb, sizeof(hb)) == ESP_OK
-             && hb.magic == GEN_MAGIC && hb.ver == 1;
+             && hb.magic == GEN_MAGIC && (hb.ver == 1 || hb.ver == 2);   // v8.29
   char lgf[64] = "", laf[64] = "";
   { Preferences p;
     if (p.begin("aprsmap", true)) {
@@ -1636,9 +1900,9 @@ static void computeView() {
   int h = bi.ok ? bi.h : 240;
   double fit = min(320.0 / w, 240.0 / h);
   double s;
-  // v8.15: three stages - x1 = the whole map, then x1.5 and x2
-  static const double ZSCL[3] = { 1.0, 1.5, 2.0 };
-  int li = zoomLevel; if (li < 0) li = 0; if (li > 2) li = 2;
+  // four stages - x1 = the whole map, then x1.5 / x2 / x2.5 (v8.22)
+  static const double ZSCL[4] = { 1.0, 1.5, 2.0, 2.5 };
+  int li = zoomLevel; if (li < 0) li = 0; if (li > 3) li = 3;
   s = fit * ZSCL[li];
   vScale = s;
   vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
@@ -1674,9 +1938,9 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
 }
 
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
-// map1 (all of Kagawa) is what you see first. Zoom in with [+] / station taps.
+// map1 (the detailed map) is what you see first. Zoom in with [+] / station taps.
 static int maxZoomLevel() {
-  return 2;   // v8.15: three stages (x1 / x1.5 / x2)
+  return 3;   // v8.22: four stages (x1 / x1.5 / x2 / x2.5)
 }
 static int defaultZoomLevel() {
   return 0;   // every screen opens at x1 (APRS) / the fit view
@@ -1734,6 +1998,76 @@ static inline bool mapCoastAt(int sx, int sy) {
   return (mapClassPtr[curMap][i >> 3] >> (7 - (i & 7))) & 1;
 }
 
+// v8.23: generated colour maps (GSI pale) are stored as standard
+// RGB565 in the mapdata partition, read through the same mmap.
+static inline uint16_t mapColorAt(int sx, int sy) {
+  const uint16_t* m = (const uint16_t*)mapColorPtr[curMap];
+  return m[sy * MAP_W + sx];
+}
+// Pack 5/6/5 fields into a panel-ready value. v8.26: this unit's
+// pushImage wants the RGB565 value BYTE-SWAPPED - the same form the
+// 028 (ILI9342) proved with its colour map. The (b,r,g) channel
+// rotation packed here in v8.23-v8.25 was a misdiagnosis carried
+// over from the mono palettes (whose white/green/near-black hues
+// look almost the same under either transform): with it, the GSI
+// sea (190,210,255) displayed as magenta. The stored map is plain
+// RGB565 and was always correct - only this final pack was wrong,
+// so fixing it needs NO map remake.
+static inline uint16_t panelPack565(int r5, int g6, int b5) {
+  uint16_t v = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+  return (uint16_t)((v << 8) | (v >> 8));
+}
+// v8.27: the 028's proven look, applied to the averaged colour at
+// render time (stored data untouched): dim everything x0.65, and
+// deepen sea pixels - GSI pale water is blue-dominant (b > g > r
+// with a wide b-r gap), land whites/tints are near-neutral or warm,
+// so the test is safe - with per-channel factors.
+static inline uint16_t colourFinish(int r5, int g6, int b5) {
+  int r8 = r5 << 3, g8 = g6 << 2, b8 = b5 << 3;
+  if (b8 > g8 + 8 && g8 > r8 + 8 && b8 - r8 > 30) {
+    r8 = (int)(r8 * 0.42); g8 = (int)(g8 * 0.68); b8 = (int)(b8 * 0.85);
+  } else {
+    r8 = (int)(r8 * 0.65); g8 = (int)(g8 * 0.65); b8 = (int)(b8 * 0.65);
+  }
+  return panelPack565(r8 >> 3, g8 >> 2, b8 >> 3);
+}
+
+// Colour of one map pixel at image coords (ix, iy): bilinear when
+// zoomed past 1:1, box average otherwise - mirroring mapPixelAt.
+static inline uint16_t colourSample(int ix, int iy) {
+  if (vScale > 1.0) {
+    double srcYf = vRectY0 + iy / vScale;
+    int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
+    int sy1 = min(sy0 + 1, MAP_H - 1);
+    double fy = srcYf - floor(srcYf); if (fy < 0) fy = 0;
+    double srcXf = vRectX0 + ix / vScale;
+    int sx0 = (int)srcXf; if (sx0 < 0) sx0 = 0; if (sx0 >= MAP_W) sx0 = MAP_W - 1;
+    int sx1 = min(sx0 + 1, MAP_W - 1);
+    double fx = srcXf - floor(srcXf); if (fx < 0) fx = 0;
+    uint16_t c00 = mapColorAt(sx0, sy0), c10 = mapColorAt(sx1, sy0);
+    uint16_t c01 = mapColorAt(sx0, sy1), c11 = mapColorAt(sx1, sy1);
+    int r = (int)(((c00 >> 11) & 0x1F) * (1 - fx) * (1 - fy) + ((c10 >> 11) & 0x1F) * fx * (1 - fy)
+                + ((c01 >> 11) & 0x1F) * (1 - fx) * fy + ((c11 >> 11) & 0x1F) * fx * fy + 0.5);
+    int g = (int)(((c00 >> 5) & 0x3F) * (1 - fx) * (1 - fy) + ((c10 >> 5) & 0x3F) * fx * (1 - fy)
+                + ((c01 >> 5) & 0x3F) * (1 - fx) * fy + ((c11 >> 5) & 0x3F) * fx * fy + 0.5);
+    int b = (int)((c00 & 0x1F) * (1 - fx) * (1 - fy) + (c10 & 0x1F) * fx * (1 - fy)
+                + (c01 & 0x1F) * (1 - fx) * fy + (c11 & 0x1F) * fx * fy + 0.5);
+    return colourFinish(r, g, b);
+  }
+  int ys = (int)(vRectY0 + iy / vScale); if (ys < 0) ys = 0; if (ys >= MAP_H) ys = MAP_H - 1;
+  int ye = (int)(vRectY0 + (iy + 1) / vScale); if (ye <= ys) ye = ys + 1; if (ye > MAP_H) ye = MAP_H;
+  int xs = (int)(vRectX0 + ix / vScale); if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
+  int xe = (int)(vRectX0 + (ix + 1) / vScale); if (xe <= xs) xe = xs + 1; if (xe > MAP_W) xe = MAP_W;
+  long sr = 0, sg = 0, sb = 0; int cnt = 0;
+  for (int sy = ys; sy < ye; sy++)
+    for (int sx = xs; sx < xe; sx++) {
+      uint16_t c = mapColorAt(sx, sy);
+      sr += (c >> 11) & 0x1F; sg += (c >> 5) & 0x3F; sb += c & 0x1F; cnt++;
+    }
+  if (!cnt) return colourFinish(31, 63, 31);
+  return colourFinish((int)(sr / cnt), (int)(sg / cnt), (int)(sb / cnt));
+}
+
 // Dark theme palettes by line class (user request): coastlines white,
 // borders green; both ramp from the near-black background.
 static uint16_t inkPalW[256];
@@ -1772,6 +2106,7 @@ static uint16_t mapPixelAt(int x, int y) {
   if (iy < 0 || iy >= vImgRows) return 0;
   int ix = x - vXOff;
   if (ix < 0 || ix >= vImgCols) return 0;
+  if (genColorActive) return colourSample(ix, iy);   // v8.23
   if (vScale > 1.0) {
     double srcYf = vRectY0 + iy / vScale;
     int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
@@ -1823,7 +2158,35 @@ static uint16_t mapPixelAt(int x, int y) {
   return (mnC ? inkPalW : inkPalG)[255 - g];
 }
 
+static void drawMapColour() {
+  if (!mapChunk)
+    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+  computeView();
+  vImgRows = (int)lround(vSrcH * vScale);
+  vImgCols = (int)lround(vSrcW * vScale);
+  uint32_t t0 = millis();
+  G->startWrite();
+  chunkRows = 0;
+  for (int y = 0; y < 240; y++) {
+    int iy = y - vYOff;
+    if (iy < 0 || iy >= vImgRows) {
+      for (int x = 0; x < 320; x++) rowPixBuf[x] = 0;
+      emitLine(y);
+      continue;
+    }
+    for (int x = 0; x < 320; x++) {
+      int ix = x - vXOff;
+      if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
+      rowPixBuf[x] = colourSample(ix, iy);
+    }
+    emitLine(y);
+  }
+  G->endWrite();
+  Serial.printf("map render: %lu ms (colour)\n", (unsigned long)(millis() - t0));
+}
+
 static void drawMap() {
+  if (genColorActive) { drawMapColour(); return; }   // v8.23
   if (!mapChunk)   // freed before each ADS-B fetch to give TLS the heap
     mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);   // IRAM placement of this buffer caused the v76/v3-style LoadStoreError reboots
   if (!inkPalInit) initInkPal();
@@ -1939,8 +2302,11 @@ static void drawBarF(bool force, bool push) {
   static const struct { int x, w; const char* lb; } TABS[MODE_COUNT] = {
     {2, 44, "APRS"}, {48, 44, "FLIGHT"}, {94, 30, "AIS"}
   };
+  int tabX = 2;   // v8.22: visible tabs pack from the left; hidden screens get no tab
   for (int i = 0; i < MODE_COUNT; i++) {
-    int tx = TABS[i].x, tw = TABS[i].w;
+    if (!screenVisible(i)) continue;
+    int tw = TABS[i].w;
+    int tx = tabX; tabX += tw + 2;
     const char* lb = TABS[i].lb;
     if (screenMode == i) {
       G->fillRect(tx, 2, tw, 18, TFT_WHITE);
@@ -1993,6 +2359,7 @@ static void drawHomeMarker() {
 }
 
 static void drawStations() {
+  G->setTextWrap(false);   // v8.22 (028 v183N port): labels clip at the right edge instead of wrapping their tail to the left edge
   int px, py;
   for (int i = 0; i < MAX_STATIONS; i++) {
     if (!stations[i].used) { snapUsed[i] = false; continue; }
@@ -2036,6 +2403,7 @@ static char snapSelAcFlight[12] = "";          // selection as drawn (v78)
 static bool snapDetailIsAc = false;
 
 static void drawAircraft() {
+  G->setTextWrap(false);   // v8.22 (028 v183N port): labels clip at the right edge instead of wrapping their tail to the left edge
   int px, py;
   for (int i = 0; i < acCount; i++) {
     if (!geoToPx(aircraft[i].lat, aircraft[i].lon, px, py)) { snapAcPx[i] = -1; continue; }
@@ -2053,8 +2421,8 @@ static void drawAircraft() {
     strncpy(snapAcFlight[i], aircraft[i].flight, sizeof(snapAcFlight[i]) - 1);
     snapAcFlight[i][sizeof(snapAcFlight[i]) - 1] = 0;
     snapAcTrack[i] = aircraft[i].track;
-    uint16_t col = sel ? TFT_YELLOW : TFT_CYAN;
-    // small triangle pointing along the track, cyan like a radar plot
+    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;
+    // small triangle pointing along the track, orange like APRS (v8.22)
     float r = aircraft[i].track * (float)DEG_TO_RAD;
     float sn = sinf(r), cs = cosf(r);
     int nx = px + (int)(9 * sn),  ny = py - (int)(9 * cs);         // nose
@@ -2089,6 +2457,7 @@ static char snapShipName[MAX_SHIPS][24] = {};  // label as drawn (v78)
 static uint32_t snapSelShipMmsi = 0;           // selection as drawn (v78)
 
 static void drawShips() {
+  G->setTextWrap(false);   // v8.22 (028 v183N port): labels clip at the right edge instead of wrapping their tail to the left edge
   int px, py;
   for (int i = 0; i < MAX_SHIPS; i++) {
     if (!ships[i].used || !ships[i].hasPos) { snapShipPx[i] = -1; continue; }
@@ -2115,7 +2484,7 @@ static void drawShips() {
     snapShipUnder[i] = underway;
     strncpy(snapShipName[i], label, sizeof(snapShipName[i]) - 1);
     snapShipName[i][sizeof(snapShipName[i]) - 1] = 0;
-    uint16_t col = sel ? TFT_YELLOW : TFT_SKYBLUE;
+    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;
     if (underway) {
       // triangle pointing along the course over ground
       float r = ships[i].cog * (float)DEG_TO_RAD;
@@ -2148,10 +2517,10 @@ static void drawShips() {
 // ◀ ▶ ▲ ▼ hints at the screen edges while zoomed in (the pan tap zones)
 static void drawPanHints() {
   if (zoomLevel <= defaultZoomLevel()) return;
-  G->fillTriangle(8, 120, 2, 112, 2, 128, TFT_SILVER);
-  G->fillTriangle(311, 120, 317, 112, 317, 128, TFT_SILVER);
-  G->fillTriangle(160, BAR_H + 3, 152, BAR_H + 13, 168, BAR_H + 13, TFT_SILVER);
-  G->fillTriangle(160, 237, 152, 227, 168, 227, TFT_SILVER);
+  G->fillTriangle(8, 120, 2, 112, 2, 128, TFT_BLACK);
+  G->fillTriangle(311, 120, 317, 112, 317, 128, TFT_BLACK);
+  G->fillTriangle(160, BAR_H + 3, 152, BAR_H + 13, 168, BAR_H + 13, TFT_BLACK);
+  G->fillTriangle(160, 237, 152, 227, 168, 227, TFT_BLACK);
 }
 
 // APRS display policy (user request): fixed stations are stored and
@@ -2221,7 +2590,7 @@ static void drawAcDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_CYAN, 0x1082);
+  G->setTextColor(TFT_ORANGE, 0x1082);
   G->setCursor(16, 34);
   G->print(a.flight);
   G->setFont(&fonts::Font0);
@@ -2260,7 +2629,7 @@ static void drawShipDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_SKYBLUE, 0x1082);
+  G->setTextColor(TFT_ORANGE, 0x1082);
   G->setCursor(16, 34);
   char title[28];
   if (s->name[0]) strncpy(title, s->name, sizeof(title) - 1);
@@ -3464,6 +3833,7 @@ static void clampCenter() {
 // ---- screen switching ------------------------------------------------
 static void switchMode(int m) {
   if (m == screenMode) return;
+  if (!screenVisible(m)) return;   // v8.22: a hidden screen cannot be opened
   modeCenterLat[screenMode] = centerLat;
   modeCenterLon[screenMode] = centerLon;
   modeZoom[screenMode] = zoomLevel;
@@ -3646,7 +4016,7 @@ static void handleButton(int btn, bool lng) {   // btn 0=A 1=B 2=C
     }
     return;
   }
-  // C long: zoom one step forward (x1 -> x1.5 -> x2), wrapping
+  // C long: zoom one step forward (x1 -> x1.5 -> x2 -> x2.5), wrapping
   zoomLevel = (zoomLevel >= maxZoomLevel()) ? 0 : zoomLevel + 1;
   clampCenter();
   mapDirty = true; fullRedraw = true; return;
@@ -3680,7 +4050,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v8.21");
+  tft.print("APRS Map Viewer M5 v8.30");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -3740,9 +4110,11 @@ void setup() {
     modeCenterLon[i] = (mm.east + mm.west) / 2;
     modeZoom[i] = 0;   // v8.9: every mode opens at x1 / the fit view
   }
-  centerLat = modeCenterLat[0];
-  centerLon = modeCenterLon[0];
-  zoomLevel = modeZoom[0];
+  screenMode = firstVisibleMode();   // v8.22: boot opens on the first shown screen
+  curMap = MODE_MAP[screenMode];
+  centerLat = modeCenterLat[screenMode];
+  centerLon = modeCenterLon[screenMode];
+  zoomLevel = modeZoom[screenMode];
 
   aprsSetup();
   redraw();
