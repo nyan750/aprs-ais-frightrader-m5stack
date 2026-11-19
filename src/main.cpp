@@ -396,6 +396,9 @@ static bool jsonNumField(const String& s, const char* key, int from, int to, dou
   return true;
 }
 
+static bool aisIsUp();         // v8.31: defined with the AIS engine
+static void aisPauseStream();  // v8.31
+
 // Pull the aircraft within AC_DIST_NM of the filter centre from the
 // community ADS-B feed and replace the table (each reply is complete).
 static void fetchAircraft() {
@@ -403,6 +406,13 @@ static void fetchAircraft() {
   // The map render chunk (38,400 B) squeezes the heap that TLS and the
   // response String need; hand it back (drawMap re-allocates on demand).
   if (mapChunk) { free(mapChunk); mapChunk = nullptr; }
+  // v8.31: two live TLS stacks do not fit this heap. While the AIS
+  // stream (the other WiFiClientSecure) is connected, this handshake
+  // starves - http -1 with the largest block stuck at ~41 KB - and
+  // the aircraft table goes stale, so the FLIGHT screen shows few or
+  // no aircraft. Pause the stream for the fetch; aisLoop reconnects
+  // it on its next pass (the pattern both 028 builds use).
+  if (aisIsUp()) aisPauseStream();
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -3732,6 +3742,14 @@ static void makeWsKey(char* out) {   // Sec-WebSocket-Key: base64 of 16 random b
   out[o] = 0;
 }
 
+static bool aisIsUp() { return aisSockUp; }
+static void aisPauseStream() {   // v8.31: see fetchAircraft
+  if (!aisSockUp) return;
+  aisSock.stop();
+  aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
+  aisNextTryMs = millis();   // aisLoop reconnects on its next pass
+}
+
 static bool aisConnect() {
   if (mapChunk) { free(mapChunk); mapChunk = nullptr; }   // TLS handshake headroom
   aisSock.setInsecure();
@@ -4050,7 +4068,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v8.30");
+  tft.print("APRS Map Viewer M5 v8.31");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
