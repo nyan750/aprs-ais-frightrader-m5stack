@@ -50,7 +50,7 @@ static double homeLat = FILTER_LAT, homeLon = FILTER_LON;
 static int cfgRangeKm = FILTER_RANGE_KM;
 static uint8_t cfgScreens = 0;   // v8.22: shown screens bitmask (bit0 APRS, bit1 FLIGHT, bit2 AIS); 0 = all shown
 static bool screenVisible(int m) { return cfgScreens == 0 || (cfgScreens & (1 << m)); }
-static int firstVisibleMode() { for (int i = 0; i < 3; i++) if (screenVisible(i)) return i; return 0; }
+static int firstVisibleMode() { static const int ORDER[3] = {1, 2, 0}; for (int k = 0; k < 3; k++) if (screenVisible(ORDER[k])) return ORDER[k]; return 1; }   // v8.33: FLIGHT, AIS, APRS (like S3 v22)
 static WebServer cfgServer(80);
 static DNSServer dnsServer;
 static bool cfgServerStarted = false;
@@ -612,7 +612,7 @@ static bool   detailOpen = false;
 // keeps its own centre/zoom. AIS shares the Flight screen's map.
 #define MODE_COUNT 3
 static const int MODE_MAP[MODE_COUNT] = {0, 1, 1};   // APRS, Flight, AIS
-static int    screenMode = 0;              // 0 = APRS, 1 = Flight, 2 = AIS
+static int    screenMode = 1;              // 0 = APRS, 1 = Flight, 2 = AIS (v8.33: boot on FLIGHT, like S3 v22)
 static double modeCenterLat[MODE_COUNT] = {0, 0, 0}, modeCenterLon[MODE_COUNT] = {0, 0, 0};
 static int    modeZoom[MODE_COUNT] = {0, 0, 0};
 static bool   listOpen = false;
@@ -2313,7 +2313,9 @@ static void drawBarF(bool force, bool push) {
     {2, 44, "APRS"}, {48, 44, "FLIGHT"}, {94, 30, "AIS"}
   };
   int tabX = 2;   // v8.22: visible tabs pack from the left; hidden screens get no tab
-  for (int i = 0; i < MODE_COUNT; i++) {
+  static const int TAB_ORDER[3] = {1, 2, 0};   // v8.33: FLIGHT, AIS, APRS (like S3 v22)
+  for (int k = 0; k < MODE_COUNT; k++) {
+    int i = TAB_ORDER[k];
     if (!screenVisible(i)) continue;
     int tw = TABS[i].w;
     int tx = tabX; tabX += tw + 2;
@@ -2431,7 +2433,7 @@ static void drawAircraft() {
     strncpy(snapAcFlight[i], aircraft[i].flight, sizeof(snapAcFlight[i]) - 1);
     snapAcFlight[i][sizeof(snapAcFlight[i]) - 1] = 0;
     snapAcTrack[i] = aircraft[i].track;
-    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;
+    uint16_t col = sel ? TFT_YELLOW : TFT_GREEN;   // v8.32: bright green (unified with S3 v13)
     // small triangle pointing along the track, orange like APRS (v8.22)
     float r = aircraft[i].track * (float)DEG_TO_RAD;
     float sn = sinf(r), cs = cosf(r);
@@ -2494,7 +2496,7 @@ static void drawShips() {
     snapShipUnder[i] = underway;
     strncpy(snapShipName[i], label, sizeof(snapShipName[i]) - 1);
     snapShipName[i][sizeof(snapShipName[i]) - 1] = 0;
-    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;
+    uint16_t col = sel ? TFT_YELLOW : TFT_CYAN;   // v8.32: cyan (unified with S3 v13)
     if (underway) {
       // triangle pointing along the course over ground
       float r = ships[i].cog * (float)DEG_TO_RAD;
@@ -2600,7 +2602,7 @@ static void drawAcDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_ORANGE, 0x1082);
+  G->setTextColor(TFT_GREEN, 0x1082);   // v8.32: match the marker colour
   G->setCursor(16, 34);
   G->print(a.flight);
   G->setFont(&fonts::Font0);
@@ -2639,7 +2641,7 @@ static void drawShipDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_ORANGE, 0x1082);
+  G->setTextColor(TFT_CYAN, 0x1082);   // v8.32: match the marker colour
   G->setCursor(16, 34);
   char title[28];
   if (s->name[0]) strncpy(title, s->name, sizeof(title) - 1);
@@ -4016,10 +4018,18 @@ static void handleButton(int btn, bool lng) {   // btn 0=A 1=B 2=C
     fullRedraw = true;
     return;
   }
-  // map screen: A/B/C short = the three tabs; the current tab's
-  // button pressed again opens LIST (v3 remap, user request)
+  // map screen: A/B/C short = the three tabs, in bar order
+  // (v8.33: A=FLIGHT, B=AIS, C=APRS, like S3 v22); the current
+  // tab's button pressed again opens LIST (v3 remap, user request).
+  // A button whose screen is hidden falls to the next visible one.
   if (!lng) {
-    if (btn != screenMode) { switchMode(btn); return; }
+    static const int BTN_ORDER[3] = {1, 2, 0};
+    int target = -1;
+    for (int k = 0; k < 3; k++) {
+      int cand = BTN_ORDER[(btn + k) % 3];
+      if (screenVisible(cand)) { target = cand; break; }
+    }
+    if (target >= 0 && target != screenMode) { switchMode(target); return; }
     listCursor = max(0, selectionListPos());
     listPage = listCursor / LIST_ROWS;
     listOpen = true; fullRedraw = true; return;
@@ -4068,7 +4078,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v8.31");
+  tft.print("APRS Map Viewer M5 v8.33");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
