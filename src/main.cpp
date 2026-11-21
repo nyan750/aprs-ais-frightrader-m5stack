@@ -377,7 +377,7 @@ static uint32_t lastAcFetchMs = 0;
 static uint16_t* mapChunk = nullptr;   // 60-row map render chunk (38,400 B, v76)
 #define MAP_CHUNK_ROWS 60
 static bool acFetchedOnce = false;
-#define AC_POLL_MS 60000
+#define AC_POLL_MS 30000   // v8.34: 30 s FLIGHT polls (was 60 s, like 028 v191N); fetches run only while FLIGHT is shown, and this interval is also the retry cadence
 
 static bool jsonStrField(const String& s, const char* key, int from, int to, char* out, size_t outSz) {
   int k = s.indexOf(key, from);
@@ -3798,6 +3798,13 @@ static bool aisConnect() {
 
 static void aisLoop() {
   if (cfgAisKey.length() < 10) return;   // no key set: AIS screen stays empty
+  if (screenMode != 2) {   // v8.34: the AIS stream runs only while the AIS screen is shown (like 028 v190N)
+    if (aisSockUp) {
+      aisSock.stop(); aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
+      Serial.println("AIS stopped (AIS screen not shown)");
+    }
+    return;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     if (aisSockUp) { aisSock.stop(); aisSockUp = false; aisOnline = false; }
     return;
@@ -3870,6 +3877,8 @@ static void switchMode(int m) {
   listOpen = false;
   mapDirty = true;
   fullRedraw = true;
+  if (m == 1) acFetchedOnce = false;   // v8.34: fetch immediately on arrival at FLIGHT
+  if (m == 2) aisNextTryMs = 0;        // v8.34: connect immediately on arrival at AIS
 }
 
 // ---- list selection (shared by the old touch path and the
@@ -4078,7 +4087,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer M5 v8.33");
+  tft.print("APRS Map Viewer M5 v8.34");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -4156,7 +4165,7 @@ void loop() {
   aisLoop();
   buttonLoop();
   uint32_t now = millis();
-  if ((!acFetchedOnce || now - lastAcFetchMs > AC_POLL_MS) && WiFi.status() == WL_CONNECTED) {
+  if (screenMode == 1 && (!acFetchedOnce || now - lastAcFetchMs > AC_POLL_MS) && WiFi.status() == WL_CONNECTED) {   // v8.34: fetch only while FLIGHT is shown (like 028 v190N)
     lastAcFetchMs = now;
     acFetchedOnce = true;
     fetchAircraft();
